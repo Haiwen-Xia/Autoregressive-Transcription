@@ -197,8 +197,6 @@ class Llama(nn.Module):
         # input_len = ids.shape[1]
 
         for t in range(max_new_ids):
-            print(t)
-
             # Forward
             outputs = self(seqs=seqs, seq_types=seq_types)
 

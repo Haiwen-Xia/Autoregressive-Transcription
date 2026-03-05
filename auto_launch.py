@@ -35,8 +35,8 @@ def build_launch_command(
 ) -> tuple[list[str], dict[str, str]]:
     env = os.environ.copy()
 
-    if nproc <= 0:
-        cmd = [python_exe, str(train_script), *passthrough]
+    if nproc <= 1:
+        cmd = [python_exe, str(train_script), f"train.device=cuda:{gpu_ids}"] + passthrough
         return cmd, env
 
     env["CUDA_VISIBLE_DEVICES"] = gpu_ids
@@ -73,7 +73,7 @@ def main_func(args: argparse.Namespace) -> int:
         passthrough=args.train_args,
     )
 
-    if nproc <= 0:
+    if nproc <= 1:
         print("[auto_launch] CPU launch:")
     else:
         print(f"[auto_launch] Multi-GPU launch: CUDA_VISIBLE_DEVICES={gpu_ids}, num_processes={nproc}")

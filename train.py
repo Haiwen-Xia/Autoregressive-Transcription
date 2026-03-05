@@ -94,14 +94,27 @@ def main_func(cfg: DictConfig) -> None:
 
     train_sampler = InfiniteSampler(train_dataset)
 
-    train_dataloader = DataLoader(
-        dataset=train_dataset, 
-        batch_size=configs["train"]["batch_size_per_device"], 
-        sampler=train_sampler,
-        num_workers=configs["train"]["num_workers"], 
-        collate_fn=collate_fn,
-        pin_memory=True,
-    )
+    num_workers = configs["train"]["num_workers"]
+    dataloader_kwargs = {
+        "dataset": train_dataset,
+        "batch_size": configs["train"]["batch_size_per_device"],
+        "sampler": train_sampler,
+        "num_workers": num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": True,
+    }
+
+    if num_workers > 0:
+        dataloader_kwargs.update(
+            {
+                "multiprocessing_context": "spawn",
+                "persistent_workers": True,
+                "prefetch_factor": 2,
+                "timeout": 120,
+            }
+        )
+
+    train_dataloader = DataLoader(**dataloader_kwargs)
 
     audio_encoder = get_audio_encoder(
         configs=configs,
@@ -141,7 +154,7 @@ def main_func(cfg: DictConfig) -> None:
 
         # 1.2 Encode audio into latent
         audio = audio.to(device)
-        audio_latent = audio_encoder.encode(audio=audio, train_mode=configs["audio_encoder"]["trainable"])  # shape: (b, t, d)
+        audio_latent = cast(Any, audio_encoder).encode(audio=audio, train_mode=configs["audio_encoder"]["trainable"])  # shape: (b, t, d)
 
         # 1.3 Tokenize question text to IDs
         question_ids = tokenizer.texts_to_ids(
