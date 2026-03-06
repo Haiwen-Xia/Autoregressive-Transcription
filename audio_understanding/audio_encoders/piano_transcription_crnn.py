@@ -3,12 +3,14 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torchaudio
+from piano_transcription_inference import config as pt_config
 from piano_transcription_inference import PianoTranscription
+from piano_transcription_inference.models import Regress_onset_offset_frame_velocity_CRNN
 
 
 class PianoTranscriptionCRnn(nn.Module):
 
-    def __init__(self, sr: float, trainable: bool) -> None:
+    def __init__(self, sr: float, trainable: bool, random: bool=False) -> None:
         r"""Piano transcription encoder [1]
 
         [1] Q. Kong, et al., High-resolution Piano Transcription with Pedals by 
@@ -23,7 +25,13 @@ class PianoTranscriptionCRnn(nn.Module):
         self.model_sr = 16000  # Piano transcription encoder sampling rate
         self.trainable = trainable
 
-        self.model = PianoTranscription(device="cpu", checkpoint_path=None).model
+        if random:
+            self.model = Regress_onset_offset_frame_velocity_CRNN(
+                frames_per_second=pt_config.frames_per_second,
+                classes_num=pt_config.classes_num,
+            )
+        else:
+            self.model = PianoTranscription(device="cpu", checkpoint_path=None).model
         self.latent_dim = 88 * 4
 
     def encode(self, audio: torch.Tensor, train_mode) -> torch.Tensor:

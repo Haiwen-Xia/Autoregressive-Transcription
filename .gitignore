@@ -3,5 +3,7 @@ wandb/
 __pycache__/
 
 maestro/
-
+slakh/
 outputs/
+
+*.log
