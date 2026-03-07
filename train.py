@@ -20,6 +20,7 @@ from tqdm import tqdm
 import wandb
 from audio_understanding.data.samplers import InfiniteSampler
 from audio_understanding.utils import LinearWarmUp, remove_padded_columns
+from inference_transcription import transcribe_audio, format_tokens_by_event, tokens_to_midi
 
 
 def _setup_output_and_logger(configs: dict, script_name: str) -> tuple[Path, Path, Path, logging.Logger]:
@@ -29,11 +30,12 @@ def _setup_output_and_logger(configs: dict, script_name: str) -> tuple[Path, Pat
     output_root = Path(output_root_value)
     if not output_root.is_absolute():
         output_root = (root_dir / output_root).resolve()
-
+    if configs.get("no_log", False):
+        output_root = output_root / "no_log"
     run_name = configs.get("run_name")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     if run_name:
-        processed_run_name = f"{run_name}_{timestamp}"
+        processed_run_name = f"{timestamp}_{run_name}"
     else:
         processed_run_name = timestamp
 
@@ -212,7 +214,7 @@ def main_func(cfg: DictConfig) -> None:
             if wandb_log:
                 wandb.log(data={"train_loss_step": loss.item()}, step=step)
 
-        if step > 0 and step % configs["train"]["test_every_n_steps"] == 500:
+        if step % configs["train"]["test_every_n_steps"] == 500:
             train_loss = validate(
                 configs=configs,
                 dataset=train_dataset,
@@ -237,7 +239,7 @@ def main_func(cfg: DictConfig) -> None:
 
             logger.info("Train loss: %.6f", train_loss)
             logger.info("Test loss: %.6f", test_loss)
-
+        #* might open specific log around here
         if step > 0 and step % configs["train"]["save_every_n_steps"] == 0:
             ckpt_path = ckpt_dir / f"step={step}.pth"
             ckpt = {}
@@ -251,10 +253,102 @@ def main_func(cfg: DictConfig) -> None:
             torch.save(ckpt, ckpt_path)
             logger.info("Save model to %s", ckpt_path)
 
+        # ------ Transcription sample logging (at save steps) ------
+        if step * 10 % configs["train"]["save_every_n_steps"] == 0:
+            _log_transcription_samples(
+                configs=configs,
+                dataset=test_dataset,
+                audio_encoder=audio_encoder,
+                tokenizer=tokenizer,
+                llm=llm,
+                output_dir=output_dir,
+                step=step,
+                logger=logger,
+                device=device,
+                n_samples=2,
+            )
+
         if step == configs["train"]["training_steps"]:
             break
         
         
+def _log_transcription_samples(
+    configs: dict,
+    dataset,
+    audio_encoder: nn.Module,
+    tokenizer,
+    llm: nn.Module,
+    output_dir: Path,
+    step: int,
+    logger: logging.Logger,
+    device: str,
+    n_samples: int = 2,
+) -> None:
+    """Pick n_samples from dataset, run constrained decoding, log results."""
+    import soundfile as sf
+
+    include_program = configs.get("midi_include_program", False)
+    sr = configs["sample_rate"]
+    outputs_dir = output_dir / "outputs" / f"step={step}"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    skip_n = max(1, len(dataset) // n_samples)
+    sample_indices = list(range(0, len(dataset), skip_n))[:n_samples]
+
+    for idx in sample_indices:
+        data = dataset[idx]
+        audio_path = data.get("audio_path", "unknown")
+        midi_path = data.get("midi_path", "unknown")
+        question = data.get("question", "Music transcription.")
+        gt_tokens = data.get("token", [])
+
+        logger.info("=== Transcription sample idx=%d step=%d ===", idx, step)
+        logger.info("  audio_path: %s", audio_path)
+        logger.info("  midi_path:  %s", midi_path)
+        logger.info("  question:   %s", question)
+        logger.info("  GT tokens (%d):", len(gt_tokens))
+        logger.info(f"  GT notes: {len(format_tokens_by_event(gt_tokens, include_program=include_program).splitlines())}")
+
+        # Prepare audio tensor (1, 1, samples)
+        audio = data["audio"]  # (c, samples) numpy or tensor
+        if not isinstance(audio, torch.Tensor):
+            audio = torch.Tensor(audio)
+        audio_tensor = audio.unsqueeze(0).to(device)  # (1, c, samples)
+
+        # Save 5s audio clip
+        clip_path = outputs_dir / f"sample_{idx}.wav"
+        audio_np = audio.squeeze().cpu().numpy()
+        sf.write(str(clip_path), audio_np, sr)
+
+        # Save ground truth MIDI from tokens
+        gt_midi_path = str(outputs_dir / f"sample_{idx}_gt.mid")
+        if gt_tokens:
+            tokens_to_midi(tokens=gt_tokens, fps=configs["fps"],
+                           output_path=gt_midi_path, include_program=include_program)
+
+        # Run constrained decoding
+        midi_out_path = str(outputs_dir / f"sample_{idx}.mid")
+        result = transcribe_audio(
+            audio_encoder=audio_encoder,
+            llm=llm,
+            tokenizer=tokenizer,
+            audio_tensor=audio_tensor,
+            configs=configs,
+            output_midi_path=midi_out_path,
+            question=question,
+            temperature=1.0,
+            top_k=1,
+        )
+
+        logger.info("  Output tokens (%d):", len(result["tokens"]))
+        logger.info(f"  Output notes: {len(format_tokens_by_event(result['tokens'], include_program=include_program).splitlines())}")
+       # logger.info("\n%s", format_tokens_by_event(result["tokens"], include_program=include_program))
+        logger.info("  Violations: %d/%d", result["violations"], result["total_topk"])
+        logger.info("  Saved audio clip: %s", clip_path)
+        logger.info("  Saved GT MIDI: %s", gt_midi_path)
+        logger.info("  Saved output MIDI: %s", midi_out_path)
+
+
 def get_dataset(
     configs: dict, 
     split: str
@@ -266,6 +360,7 @@ def get_dataset(
 
     sr = configs["sample_rate"]
     clip_duration = configs["clip_duration"]
+    include_program = configs["midi_include_program"] if "midi_include_program" in configs else False
     datasets_split = f"{split}_datasets"
 
     datasets = []
@@ -309,13 +404,11 @@ def get_dataset(
             datasets.append(dataset)
 
         elif name == "MAESTRO":
-            from audidata.transforms.midi import PianoRoll
-
             from audio_understanding.datasets.maestro import MAESTRO
             from audio_understanding.target_transforms.midi import MIDI2Tokens
 
             if configs["midi_to_tokens"] == "MIDI2Tokens":
-                midi_transform = MIDI2Tokens(fps=configs["fps"])
+                midi_transform = MIDI2Tokens(fps=configs["fps"], include_program=include_program)
             else:
                 raise NotImplementedError
 
@@ -327,12 +420,40 @@ def get_dataset(
                 transform=Mono(),
                 load_target=True,
                 extend_pedal=True,
-                target_transform=[PianoRoll(fps=100, pitches_num=128), midi_transform], #* actually, only midi_transform is needed, but we keep PianoRoll for potential future use
+                target_transform=midi_transform,
             )
             datasets.append(dataset)
 
         elif name == "Slakh2100":
-            raise NotImplementedError("Slakh2100 dataset is not implemented yet.")
+            from audio_understanding.datasets.slakh2100 import Slakh2100
+            from audio_understanding.target_transforms.midi import MIDI2Tokens
+
+            if configs["midi_to_tokens"] == "MIDI2Tokens":
+                midi_transform = MIDI2Tokens(fps=configs["fps"], include_program=include_program)
+            else:
+                raise NotImplementedError
+
+            dataset_config = configs[datasets_split][name]
+            mode = dataset_config["mode"] if "mode" in dataset_config else "all"
+            sample_num = dataset_config["sample_num"] if "sample_num" in dataset_config else 1
+            keep_track_info = dataset_config["keep_track_info"] if "keep_track_info" in dataset_config else False
+            question_config = dataset_config["question"] if "question" in dataset_config else None
+
+            dataset = Slakh2100(
+                root=dataset_config["root"],
+                split=dataset_config["split"],
+                sr=sr,
+                crop=RandomCrop(clip_duration=clip_duration, end_pad=clip_duration - 0.1),
+                transform=Mono(),
+                target=True,
+                extend_pedal=True,
+                target_transform=midi_transform,
+                sample_num=sample_num,
+                mode=mode,
+                keep_track_info=keep_track_info,
+                question_config=question_config,
+            )
+            datasets.append(dataset)
 
         elif name == "AudioCaps":
             from audio_understanding.datasets.audiocaps import AudioCaps
@@ -395,6 +516,22 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
         from audio_understanding.audio_encoders.conformer2d import Conformer2D
         model = Conformer2D(sr=sr, trainable=True)
 
+    elif name == "MERT":
+        from audio_understanding.audio_encoders.mert import MERT
+
+        target_layer = configs["audio_encoder"]["target_layer"] if "target_layer" in configs["audio_encoder"] else -1
+        pretrained_model_name = configs["audio_encoder"]["pretrained_model_name"] if "pretrained_model_name" in configs["audio_encoder"] else "m-a-p/MERT-v1-330M"
+        model = MERT(
+            sr=sr,
+            trainable=trainable,
+            target_layer=target_layer,
+            pretrained_model_name=pretrained_model_name,
+        )
+    elif name == "MuQ":
+        from audio_understanding.audio_encoders.muq import MuQ
+
+        model = MuQ(sr=sr, trainable=trainable)
+    
     else:
         raise ValueError(name)
 
@@ -515,7 +652,7 @@ def get_audio_question_answering(
     elif name in ["AudioCaps", "Clotho", "LibriSpeech", "WavCaps"]:
         return data["audio"], data["question"], data["caption"]
 
-    elif name in ["MAESTRO"]:
+    elif name in ["MAESTRO", "Slakh2100"]:
         return data["audio"], data["question"], data["token"]
 
     else:
@@ -566,7 +703,7 @@ def validate(
 
     for idx in range(0, len(dataset), skip_n):
         data = [dataset[i] for i in range(idx, min(idx + batch_size, len(dataset)))]
-        data = collate_fn(data)
+        data = cast(dict, collate_fn(data))
 
         audio, question, answering = get_audio_question_answering(data)
 

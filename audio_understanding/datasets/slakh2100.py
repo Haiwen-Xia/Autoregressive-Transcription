@@ -314,7 +314,7 @@ class Slakh2100(Dataset):
             return sorted(all_track_ids), target_ids
 
         if self.mode in ["all2several"]:
-            sample_n = min(self.sample_num, len(all_track_ids))
+            sample_n = random.randint(1, min(self.sample_num, len(all_track_ids)))
             target_ids = sorted(random.sample(all_track_ids, sample_n))
             return sorted(all_track_ids), target_ids
 
@@ -344,6 +344,7 @@ class Slakh2100(Dataset):
         question_template = self.question_config.get("template")
         instrument_info_dropout = float(self.question_config.get("instrument_info_dropout", 1.0))
         include_info = (random.random() >= instrument_info_dropout)
+        instru_dropout = self.question_config.get("drop_instrument", True)
 
         if include_info:
             instruments = []
@@ -355,9 +356,12 @@ class Slakh2100(Dataset):
                     instruments.append("program {}".format(stem_data["program_num"]))
                 else:
                     instruments.append("{} (program {})".format(stem_data["inst_class"], stem_data["program_num"]))
-
-            targets = ", ".join(instruments)
-
+            random.shuffle(instruments)
+            if instru_dropout:
+                target_length = random.randint(1, len(instruments))
+            else:
+                target_length = len(instruments)
+            targets = ", ".join(instruments[:target_length])
             if question_template is not None:
                 question = question_template.format(targets=targets)
                 return {"question": question}
@@ -365,7 +369,7 @@ class Slakh2100(Dataset):
             if self.mode in ["all2several", "all2one", "mix2one"]:
                 question = "Transcribe only the target instruments from this audio. Target instruments: {}.".format(targets)
             else:
-                question = "Transcribe this audio. Target instruments: {}.".format(targets)
+                question = "Transcribe this audio. Target instruments may include: {}.".format(targets)
 
         return {"question": question}
     
