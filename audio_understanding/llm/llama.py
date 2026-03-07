@@ -10,6 +10,7 @@ from torch.nn import functional as F
 from audio_understanding.llm.rope import build_rope, apply_rope
 
 
+#* is one singular rope for all modalities good?
 @dataclass
 class LlamaConfig:
     block_size: int = 2048
@@ -218,6 +219,65 @@ class Llama(nn.Module):
             next_id = torch.multinomial(probs, num_samples=1)  # shape: (b, 1)
 
             # Append the sampled token to the last seq
+            seqs[-1] = torch.cat((seqs[-1], next_id), dim=1)  # shape: (b, t)
+
+        return seqs
+
+    @torch.no_grad()
+    def generate_constrained(
+        self,
+        seqs: list[torch.Tensor],
+        seq_types: list[str],
+        max_new_ids: int,
+        constraint,
+        temperature: float = 1.0,
+        top_k: None | int = None,
+    ):
+        r"""Constrained auto-regressive generation.
+
+        At each step the *constraint* object restricts which token IDs are
+        allowed and counts how many of the original top-k candidates would
+        have violated the grammar.
+
+        Args:
+            seqs: input sequences (audio latent, question ids, answering ids)
+            seq_types: type tag per seq ("audio" / "id")
+            max_new_ids: maximum tokens to generate
+            constraint: object exposing get_allowed_mask(), count_violations(), update()
+            temperature: softmax temperature
+            top_k: top-k sampling width (applied *after* constraint masking)
+
+        Returns:
+            seqs: updated sequences with generated tokens appended to seqs[-1]
+        """
+        for _t in range(max_new_ids):
+            outputs = self(seqs=seqs, seq_types=seq_types)
+
+            # Text logits at the last time step
+            logits = outputs[-1][:, -1, :] / temperature  # shape: (b, v)
+
+            # --- violation counting on raw top-k (before constraint) ---
+            if top_k is not None:
+                _, raw_topk_ids = torch.topk(logits, min(top_k, logits.size(-1)))
+                constraint.count_violations(raw_topk_ids[0])  # batch=0
+
+            # --- apply constraint mask ---
+            allowed_mask = constraint.get_allowed_mask()  # (v,)  bool
+            logits[:, ~allowed_mask] = -float('Inf')
+
+            # --- top-k on constrained logits ---
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+
+            probs = F.softmax(logits, dim=-1)  # shape: (b, v)
+            next_id = torch.multinomial(probs, num_samples=1)  # shape: (b, 1)
+
+            # --- state transition; stop on SEP ---
+            should_continue = constraint.update(next_id[0, 0].item())
+            if not should_continue:
+                break
+
             seqs[-1] = torch.cat((seqs[-1], next_id), dim=1)  # shape: (b, t)
 
         return seqs

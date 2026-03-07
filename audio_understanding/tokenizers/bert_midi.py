@@ -23,7 +23,7 @@ class BertMIDI:
 
         new_vocabs += ["pitch={}".format(p) for p in range(128)]
         new_vocabs += ["velocity={}".format(v) for v in range(128)]
-        new_vocabs += ["program={}".format(p) for p in range(128)]
+        new_vocabs += ["program={}".format(p) for p in range(129)] #* 129 because program=128 is used for drums
 
         # Merge text tokens and audio tokens
         print("Original vocab size: {}".format(len(self.tok)))
