@@ -46,8 +46,9 @@ def inference(args) -> None:
 
     # Load the begining part of audio
     audio, _ = librosa.load(path=audio_path, sr=sr, mono=True)
-    audio = audio[0 : clip_samples]
+    audio = audio[2* clip_samples : 3 * clip_samples]
     audio = librosa.util.fix_length(data=audio, size=clip_samples, axis=0)
+    print("Audio time duration: {:.2f}s, sample rate: {}, samples num: {}".format(audio.shape[0] / sr, sr, audio.shape[0]))
     audio = torch.Tensor(audio[None, None, :]).to(device)  # shape: (b, c, t)
 
     # Encode audio into latent

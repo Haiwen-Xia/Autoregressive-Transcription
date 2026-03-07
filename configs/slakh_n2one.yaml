@@ -4,7 +4,7 @@ clip_duration: 5.
 max_question_len: 50
 max_answering_len: 1000
 fps: 100
-output_root: "./slakh"
+output_root: "./slakh/n2one"
 run_name: n_to_one
 midi_include_program: False
 
@@ -13,7 +13,6 @@ train_datasets:
         root: "/data/yrb/musicarena/Haiwen/slakh2100/slakh2100_flac_redux"
         split: "train"
         mode: all2one
-        target_midi_source: mix
         sample_num: 1
         keep_track_info: False
         question:
@@ -28,7 +27,6 @@ test_datasets:
         root: "/data/yrb/musicarena/Haiwen/slakh2100/slakh2100_flac_redux"
         split: "test"
         mode: all2one
-        target_midi_source: mix
         sample_num: 1
         keep_track_info: False
         question:

@@ -21,9 +21,10 @@ test_datasets:
 midi_to_tokens: MIDI2Tokens
         
 audio_encoder:
-    name: PianoTranscriptionCRnn # Conformer2d
-    trainable: False
-    random_init: True  # True: from scratch (random init), False: load pretrained from piano_transcription_inference
+    name: MERT # Conformer2d
+    trainable: True
+    
+    # random_init: True  # True: from scratch (random init), False: load pretrained from piano_transcription_inference
 
 tokenizer:
     name: BertMIDI

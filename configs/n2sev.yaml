@@ -1,41 +1,44 @@
 ---
 sample_rate: 16000
 clip_duration: 5.
-max_question_len: 50
+max_question_len: 100
 max_answering_len: 1000
 fps: 100
-output_root: "./slakh/all2all"
-run_name: all2all
+output_root: "./slakh/n2sev"
+run_name: n2sev
 midi_include_program: False
 
 train_datasets:
     Slakh2100:
         root: "/data/yrb/musicarena/Haiwen/slakh2100/slakh2100_flac_redux"
         split: "train"
-        mode: all
+        mode: all2several
+        sample_num: 1
         keep_track_info: False
         question:
             default: "Transcribe this audio."
-            instrument_repr: name
-            instrument_info_dropout: 0
-            template: null
+            instrument_repr: name_program
+            instrument_info_dropout: 0.0
+            template: "Transcribe only these instruments from this audio: {targets}."
+
 
 test_datasets:
     Slakh2100:
         root: "/data/yrb/musicarena/Haiwen/slakh2100/slakh2100_flac_redux"
         split: "test"
-        mode: all
+        mode: all2several
+        sample_num: 1
         keep_track_info: False
         question:
             default: "Transcribe this audio."
-            instrument_repr: name
-            instrument_info_dropout: 0
-            template: null
-            drop_instrument: True
+            instrument_repr: name_program
+            instrument_info_dropout: 0.0
+            template: "Transcribe only these instruments from this audio: {targets}."
+
 midi_to_tokens: MIDI2Tokens
         
 audio_encoder:
-    name:  PianoTranscriptionCRnn # Conformer2d
+    name: PianoTranscriptionCRnn # Conformer2d
     trainable: True
     random_init: False  # True: from scratch (random init), False: load pretrained from piano_transcription_inference
 
@@ -53,15 +56,14 @@ llm:
     n_embd: 768
     
 train:
-    device: "cuda:3"
+    device: "cuda:2"
     num_workers: 12
     remove_padded_columns: True
     loss: ce_loss
     optimizer: AdamW
     lr: 1e-4
     warm_up_steps: 1000  # Leave blank if no warm up is used
-    batch_size_per_device: 4
-    gradient_accumulation: 4
+    batch_size_per_device: 5
     test_every_n_steps: 1000
     save_every_n_steps: 10000
     training_steps: 100000

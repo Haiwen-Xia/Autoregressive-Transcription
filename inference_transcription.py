@@ -1,0 +1,309 @@
+"""Music transcription inference with constrained decoding.
+
+Constrained decoding enforces the MIDI token grammar (MIDI2Tokens construction order):
+    name -> time_index -> pitch -> velocity (onset only) -> program (optional)
+and tracks how many top-k candidates violate the grammar at each step.
+
+Usage:
+    python inference_transcription.py \
+        --config_yaml configs/piano_transcription_maestro.yaml \
+        --ckpt_path checkpoints/train/.../ckpt/step_XXXX.pth \
+        --audio_path /path/to/audio.wav \
+        --output_path output.mid
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import librosa
+import numpy as np
+import pretty_midi
+import soundfile as sf
+import torch
+from torch import nn
+
+from audio_understanding.target_transforms.midi_constrained import MidiConstrainedDecoder
+
+
+# ── callable core function ──────────────────────────────────────────────
+
+def transcribe_audio(
+    audio_encoder: nn.Module,
+    llm: nn.Module,
+    tokenizer,
+    audio_tensor: torch.Tensor,
+    configs: dict,
+    output_midi_path: str | None = None,
+    question: str = "Music transcription.",
+    temperature: float = 1.0,
+    top_k: int = 1,
+) -> dict:
+    """Run constrained music transcription on a single audio clip.
+
+    Args:
+        audio_encoder: pretrained audio encoder (already on device)
+        llm: Llama LLM (already on device)
+        tokenizer: BertMIDI tokenizer
+        audio_tensor: (1, 1, samples) mono audio tensor on device
+        configs: parsed yaml config dict (needs fps, max_question_len, max_answering_len, midi_include_program)
+        output_midi_path: write MIDI file here if not None
+        question: question text fed to the model
+        temperature: softmax temperature
+        top_k: top-k width (also used for violation counting)
+
+    Returns:
+        dict with keys:
+            tokens     : list[str] generated token strings
+            violations : int, number of top-k violations
+            total_topk : int, total top-k candidates checked
+            midi_path  : str | None, path to written MIDI (if output_midi_path given)
+    """
+    device = audio_tensor.device
+    include_program = configs.get("midi_include_program", False)
+
+    # Encode audio
+    audio_latent = audio_encoder.encode(audio=audio_tensor, train_mode=False)  # (1, t, d)
+
+    # Question IDs
+    question_ids = tokenizer.texts_to_ids(
+        texts=[question],
+        fix_length=configs["max_question_len"],
+    ).to(device)  # (1, t)
+
+    # Start token
+    answering_ids = torch.LongTensor([[tokenizer.cls_token_id]]).to(device)  # (1, 1)
+
+    seqs = [audio_latent, question_ids, answering_ids]
+    seq_types = ["audio", "id", "id"]
+
+    # Constrained decoding
+    constraint = MidiConstrainedDecoder(
+        tokenizer=tokenizer,
+        vocab_size=len(tokenizer),
+        include_program=include_program,
+        device=device,
+    )
+
+    was_training = llm.training
+    llm.eval()
+    with torch.no_grad():
+        output_seqs = llm.generate_constrained(
+            seqs=seqs,
+            seq_types=seq_types,
+            max_new_ids=configs["max_answering_len"],
+            constraint=constraint,
+            temperature=temperature,
+            top_k=top_k,
+        )
+    if was_training:
+        llm.train()
+
+    # Decode output IDs → token strings
+    out_ids = output_seqs[2][0]  # (t,)
+    tokens = tokenizer.tok.convert_ids_to_tokens(out_ids)
+    if tokens and tokens[0] == "[CLS]":
+        tokens = tokens[1:]
+
+    # Write MIDI
+    midi_path = None
+    if output_midi_path is not None:
+        fps = configs["fps"]
+        tokens_to_midi(tokens=tokens, fps=fps, output_path=output_midi_path,
+                       include_program=include_program)
+        midi_path = output_midi_path
+
+    return {
+        "tokens": tokens,
+        "violations": constraint.violations,
+        "total_topk": constraint.total_topk_candidates,
+        "midi_path": midi_path,
+    }
+
+
+# ── tokens formatting ──────────────────────────────────────────────────
+
+def format_tokens_by_event(tokens: list[str], include_program: bool = False) -> str:
+    """Pretty-print token list, one line per event.
+
+    Token order: name, time_index, pitch, (velocity), (program)
+    onset event len = 4 + program, offset event len = 3 + program
+    """
+    lines = []
+    i = 0
+    event_idx = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if "=" not in tok:
+            lines.append(f"  [{event_idx}] {tok}")
+            i += 1
+            event_idx += 1
+            continue
+
+        key, value = tok.split("=")
+        if key == "name":
+            # Determine event length
+            if value == "note_onset":
+                event_len = 4 + (1 if include_program else 0)
+            else:
+                event_len = 3 + (1 if include_program else 0)
+
+            chunk = tokens[i : i + event_len]
+            lines.append(f"  [{event_idx}] " + " | ".join(chunk))
+            i += event_len
+            event_idx += 1
+        else:
+            lines.append(f"  [{event_idx}] {tok}")
+            i += 1
+            event_idx += 1
+
+    return "\n".join(lines)
+
+
+# ── tokens → MIDI ──────────────────────────────────────────────────────
+
+def tokens_to_midi(
+    tokens: list[str],
+    fps: float,
+    output_path: str,
+    include_program: bool = False,
+) -> None:
+    """Convert generated token list to a MIDI file.
+
+    Expected token order per event (MIDI2Tokens construction order):
+        note_onset:  name=note_onset, time_index=X, pitch=X, velocity=X [, program=X]
+        note_offset: name=note_offset, time_index=X, pitch=X [, program=X]
+    """
+    note_dict: dict[int, list[dict]] = {p: [] for p in range(128)}
+    n = len(tokens)
+    i = 0
+
+    while i < n:
+        tok = tokens[i]
+        if "=" not in tok:
+            i += 1
+            continue
+
+        key, value = tok.split("=")
+
+        if key == "name" and value == "note_onset":
+            # name, time_index, pitch, velocity, (program)
+            event_len = 4 + (1 if include_program else 0)
+            if i + event_len > n:
+                break
+            time_index = int(tokens[i + 1].split("=")[1])
+            pitch = int(tokens[i + 2].split("=")[1])
+            velocity = int(tokens[i + 3].split("=")[1])
+            note = {"onset_time_index": time_index, "pitch": pitch, "velocity": velocity}
+            if include_program:
+                note["program"] = int(tokens[i + 4].split("=")[1])
+            note_dict[pitch].append(note)
+            i += event_len
+            continue
+
+        elif key == "name" and value == "note_offset":
+            # name, time_index, pitch, (program)
+            event_len = 3 + (1 if include_program else 0)
+            if i + event_len > n:
+                break
+            time_index = int(tokens[i + 1].split("=")[1])
+            pitch = int(tokens[i + 2].split("=")[1])
+            if len(note_dict[pitch]) > 0:
+                note_dict[pitch][-1]["offset_time_index"] = time_index
+            i += event_len
+            continue
+
+        i += 1
+
+    # Collect all notes
+    events = []
+    for p in note_dict:
+        events += note_dict[p]
+
+    # Write MIDI
+    track = pretty_midi.Instrument(program=0)
+    track.is_drum = False
+
+    for e in events:
+        start_time = e["onset_time_index"] / fps
+        end_time = e.get("offset_time_index", e["onset_time_index"] + int(fps * 0.1)) / fps
+        note = pretty_midi.Note(
+            pitch=e["pitch"],
+            start=start_time,
+            end=end_time,
+            velocity=e["velocity"],
+        )
+        track.notes.append(note)
+
+    midi_data = pretty_midi.PrettyMIDI()
+    midi_data.instruments.append(track)
+    midi_data.write(output_path)
+    print("Write out to {}".format(output_path))
+
+
+# ── CLI main ────────────────────────────────────────────────────────────
+
+def main_func(args) -> None:
+    from audio_understanding.utils import parse_yaml
+    from train import get_audio_encoder, get_llm, get_tokenizer
+
+    config_yaml = args.config_yaml
+    configs = parse_yaml(config_yaml)
+    sr = configs["sample_rate"]
+    clip_duration = configs["clip_duration"]
+    clip_samples = round(clip_duration * sr)
+    device = args.device
+
+    audio_encoder = get_audio_encoder(configs=configs, ckpt_path=args.ckpt_path).to(device)
+    tokenizer = get_tokenizer(configs=configs)
+    llm = get_llm(
+        configs=configs,
+        audio_latent_dim=audio_encoder.latent_dim,
+        vocab_size=len(tokenizer),
+        ckpt_path=args.ckpt_path,
+    ).to(device)
+
+    # Load audio segment
+    audio, _ = librosa.load(path=args.audio_path, sr=sr, mono=True)
+    start = args.segment_idx * clip_samples
+    audio_segment = audio[start : start + clip_samples]
+    audio_segment = librosa.util.fix_length(data=audio_segment, size=clip_samples, axis=0)
+    print("Segment {}: offset {:.2f}s, duration {:.2f}s, sr={}, samples={}".format(
+        args.segment_idx, start / sr, clip_duration, sr, clip_samples))
+    audio_tensor = torch.Tensor(audio_segment[None, None, :]).to(device)
+
+    result = transcribe_audio(
+        audio_encoder=audio_encoder,
+        llm=llm,
+        tokenizer=tokenizer,
+        audio_tensor=audio_tensor,
+        configs=configs,
+        output_midi_path=args.output_path,
+        question=args.question or "Music transcription.",
+        temperature=args.temperature,
+        top_k=args.top_k,
+    )
+
+    include_program = configs.get("midi_include_program", False)
+    print("Generated {} tokens".format(len(result["tokens"])))
+    print("Violations: {}/{}".format(result["violations"], result["total_topk"]))
+    print(format_tokens_by_event(result["tokens"], include_program=include_program))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Music transcription with constrained decoding")
+    parser.add_argument("--config_yaml", type=str, required=True)
+    parser.add_argument("--ckpt_path", type=str, required=True)
+    parser.add_argument("--audio_path", type=str, required=True)
+    parser.add_argument("--output_path", type=str, default="output.mid")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--segment_idx", type=int, default=0,
+                        help="Which clip_duration-sized segment to transcribe (0-indexed)")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=1,
+                        help="Top-k sampling; also used for violation counting")
+    parser.add_argument("--question", type=str, default=None,
+                        help="Override the default question text")
+    args = parser.parse_args()
+    main_func(args)
