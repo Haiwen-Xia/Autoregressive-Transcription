@@ -3,6 +3,8 @@ sample_rate: 16000
 clip_duration: 10.
 max_question_len: 50
 max_answering_len: 100
+output_root: "./music_tagging"
+run_name: null
 
 train_datasets:
     GTZAN:

@@ -4,26 +4,31 @@ clip_duration: 5.
 max_question_len: 50
 max_answering_len: 1000
 fps: 100
-output_root: "./maestro"
-run_name: null
+output_root: "./slakh"
+run_name: all2all
+midi_include_program: False
 
 train_datasets:
-    MAESTRO:
-        root: "./datasets/maestro-v3.0.0"
+    Slakh2100:
+        root: "/data/yrb/musicarena/Haiwen/slakh2100/slakh2100_flac_redux"
         split: "train"
+        mode: all
+        keep_track_info: False
+
 
 test_datasets:
-    MAESTRO:
-        root: "./datasets/maestro-v3.0.0"
+    Slakh2100:
+        root: "/data/yrb/musicarena/Haiwen/slakh2100/slakh2100_flac_redux"
         split: "test"
-
+        mode: all
+        keep_track_info: False
 
 midi_to_tokens: MIDI2Tokens
         
 audio_encoder:
     name: PianoTranscriptionCRnn # Conformer2d
-    trainable: False
-    random_init: True  # True: from scratch (random init), False: load pretrained from piano_transcription_inference
+    trainable: True
+    random_init: False  # True: from scratch (random init), False: load pretrained from piano_transcription_inference
 
 tokenizer:
     name: BertMIDI

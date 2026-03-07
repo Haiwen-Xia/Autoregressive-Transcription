@@ -1,0 +1,74 @@
+---
+sample_rate: 16000
+clip_duration: 5.
+max_question_len: 50
+max_answering_len: 1000
+fps: 100
+output_root: "./slakh"
+run_name: n_to_one
+midi_include_program: False
+
+train_datasets:
+    Slakh2100:
+        root: "/data/yrb/musicarena/Haiwen/slakh2100/slakh2100_flac_redux"
+        split: "train"
+        mode: all2one
+        target_midi_source: mix
+        sample_num: 1
+        keep_track_info: False
+        question:
+            default: "Transcribe this audio."
+            instrument_repr: name_program
+            instrument_info_dropout: 0.0
+            template: "Transcribe only these instruments from this audio: {targets}."
+
+
+test_datasets:
+    Slakh2100:
+        root: "/data/yrb/musicarena/Haiwen/slakh2100/slakh2100_flac_redux"
+        split: "test"
+        mode: all2one
+        target_midi_source: mix
+        sample_num: 1
+        keep_track_info: False
+        question:
+            default: "Transcribe this audio."
+            instrument_repr: name_program
+            instrument_info_dropout: 0.0
+            template: "Transcribe only these instruments from this audio: {targets}."
+
+midi_to_tokens: MIDI2Tokens
+        
+audio_encoder:
+    name: PianoTranscriptionCRnn # Conformer2d
+    trainable: True
+    random_init: False  # True: from scratch (random init), False: load pretrained from piano_transcription_inference
+
+tokenizer:
+    name: BertMIDI
+
+llm:
+    name: Llama
+    trainable: True
+    block_size: 2048  # Maximize block size
+    audio_latent_dim:  # Leave blank. Parsed later from audio_encoder
+    vocab_size:  # Leave blank. Parsed later from len(tokenier)
+    n_layer: 12
+    n_head: 12
+    n_embd: 768
+    
+train:
+    device: "cuda:2"
+    num_workers: 12
+    remove_padded_columns: True
+    loss: ce_loss
+    optimizer: AdamW
+    lr: 1e-4
+    warm_up_steps: 1000  # Leave blank if no warm up is used
+    batch_size_per_device: 5
+    test_every_n_steps: 1000
+    save_every_n_steps: 10000
+    training_steps: 100000
+    resume_ckpt_path:  # Leave blank if train from scratch
+
+no_log: false
