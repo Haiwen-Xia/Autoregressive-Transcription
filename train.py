@@ -146,8 +146,12 @@ def main_func(cfg: DictConfig) -> None:
     # Learnable parameters
     params = get_learnable_params(configs, audio_encoder, llm)
     optimizer, scheduler = get_optimizer_and_scheduler(configs=configs, params=params)
+    gradient_accumulation = configs["train"]["gradient_accumulation"] if "gradient_accumulation" in configs["train"] else 1
+    assert gradient_accumulation > 0
+    global_step = 0
+    optimizer.zero_grad()
 
-    for step, data in enumerate(tqdm(train_dataloader)):
+    for micro_step, data in enumerate(tqdm(train_dataloader)):
 
         # ------ 1. Data preparation ------
         # 1.1 Prepare audio, question, and answering
@@ -202,19 +206,24 @@ def main_func(cfg: DictConfig) -> None:
             ignore_index=tokenizer.pad_token_id
         )
 
-        optimizer.zero_grad()
-        loss.backward()
+        (loss / gradient_accumulation).backward()
+
+        if (micro_step + 1) % gradient_accumulation != 0:
+            continue
+
         optimizer.step()
+        optimizer.zero_grad()
+        global_step += 1
 
         if scheduler:
             scheduler.step()
 
-        if step % 100 == 0:
-            logger.info("Step: %d, Loss: %.6f", step, loss.item())
+        if global_step % 100 == 0:
+            logger.info("Step: %d, Loss: %.6f", global_step, loss.item())
             if wandb_log:
-                wandb.log(data={"train_loss_step": loss.item()}, step=step)
+                wandb.log(data={"train_loss_step": loss.item()}, step=global_step)
 
-        if step % configs["train"]["test_every_n_steps"] == 500:
+        if global_step % configs["train"]["test_every_n_steps"] == 500:
             train_loss = validate(
                 configs=configs,
                 dataset=train_dataset,
@@ -234,14 +243,14 @@ def main_func(cfg: DictConfig) -> None:
             if wandb_log:
                 wandb.log(
                     data={"train_loss": train_loss, "test_loss": test_loss},
-                    step=step,
+                    step=global_step,
                 )
 
             logger.info("Train loss: %.6f", train_loss)
             logger.info("Test loss: %.6f", test_loss)
         #* might open specific log around here
-        if step > 0 and step % configs["train"]["save_every_n_steps"] == 0:
-            ckpt_path = ckpt_dir / f"step={step}.pth"
+        if global_step > 0 and global_step % configs["train"]["save_every_n_steps"] == 0:
+            ckpt_path = ckpt_dir / f"step={global_step}.pth"
             ckpt = {}
 
             if configs["audio_encoder"]["trainable"]:
@@ -254,7 +263,7 @@ def main_func(cfg: DictConfig) -> None:
             logger.info("Save model to %s", ckpt_path)
 
         # ------ Transcription sample logging (at save steps) ------
-        if step * 10 % configs["train"]["save_every_n_steps"] == 0:
+        if global_step * 10 % configs["train"]["save_every_n_steps"] == 0:
             _log_transcription_samples(
                 configs=configs,
                 dataset=test_dataset,
@@ -262,13 +271,13 @@ def main_func(cfg: DictConfig) -> None:
                 tokenizer=tokenizer,
                 llm=llm,
                 output_dir=output_dir,
-                step=step,
+                step=global_step,
                 logger=logger,
                 device=device,
                 n_samples=2,
             )
 
-        if step == configs["train"]["training_steps"]:
+        if global_step == configs["train"]["training_steps"]:
             break
         
         
