@@ -218,3 +218,64 @@ class MAESTRO(Dataset):
             target = call(transform=self.target_transform, x=target)
 
         return target
+
+    def evaluate(
+        self,
+        data: dict,
+        output_tokens: list[str],
+        fps: float,
+    ) -> dict:
+        r"""Evaluate model output tokens against ground truth for one sample.
+
+        Computes note onset F1 and note-with-offset F1 by comparing the token
+        sequence emitted by the model with the ground-truth notes stored in
+        *data*.
+
+        Args:
+            data: dict returned by :meth:`__getitem__` (must contain ``"note"``
+                and ``"start_time"``).  The ``"note"`` value should be a list
+                of Note objects (i.e. the dataset should be instantiated with
+                a token-based ``target_transform`` such as ``MIDI2Tokens``, or
+                with ``target_transform=None``).
+            output_tokens: flat list of MIDI token strings produced by the
+                model (e.g. from :func:`~inference_transcription.transcribe_audio`).
+            fps: frames per second used when encoding tokens (must match the
+                value used during training).
+
+        Returns:
+            Dict with keys:
+
+            * ``"note_onset"``  – ``{"precision": float, "recall": float, "f1": float}``
+            * ``"note_offset"`` – ``{"precision": float, "recall": float, "f1": float}``
+        """
+        from audio_understanding.eval.transcription.metrics import (
+            parse_tokens_to_notes,
+            note_onset_f1,
+            note_with_offset_f1,
+        )
+
+        start_time = data["start_time"]
+
+        # Build reference note list (times relative to clip start)
+        ref_notes = [
+            {
+                "onset_time":  note.start - start_time,
+                "offset_time": note.end   - start_time,
+                "pitch":       note.pitch,
+                "velocity":    note.velocity,
+            }
+            for note in data["note"]
+        ]
+
+        # Parse model output tokens into note dicts
+        est_notes = parse_tokens_to_notes(
+            tokens=output_tokens,
+            fps=fps,
+            include_program=False,
+            start_time=0.0,
+        )
+
+        return {
+            "note_onset":  note_onset_f1(ref_notes, est_notes),
+            "note_offset": note_with_offset_f1(ref_notes, est_notes),
+        }
