@@ -31,7 +31,7 @@ def _setup_output_and_logger(configs: dict, script_name: str) -> tuple[Path, Pat
     if not output_root.is_absolute():
         output_root = (root_dir / output_root).resolve()
     if configs.get("no_log", False):
-        output_root = output_root / "no_log"
+        output_root = root_dir / "no_log" 
     run_name = configs.get("run_name")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     if run_name:
@@ -84,7 +84,8 @@ def main_func(cfg: DictConfig) -> None:
     if wandb_log:
         wandb.init(
             project="audio_understanding",
-            name=str(output_dir.parent.name+"/"+output_dir.name),
+            group=output_dir.parent.name, # another option is to use HydraConfig.get().runtime.config_name
+            name=str(output_dir.name),
             config=cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True)),
         )
         wandb.save(str(cfg_save_path))
@@ -316,7 +317,10 @@ def _log_transcription_samples(
         logger.info("  midi_path:  %s", midi_path)
         logger.info("  question:   %s", question)
         logger.info("  GT tokens (%d):", len(gt_tokens))
-        logger.info(f"  GT notes: {len(format_tokens_by_event(gt_tokens, include_program=include_program).splitlines())}")
+        format_str = format_tokens_by_event(gt_tokens, include_program=include_program)
+        logger.info(f"  GT notes: {len(format_str.splitlines())}")
+        sample = "\n".join(format_str.splitlines()[:10])
+        logger.info(f"Sample GT tokens:\n{sample}\n...")
 
         # Prepare audio tensor (1, 1, samples)
         audio = data["audio"]  # (c, samples) numpy or tensor
@@ -350,7 +354,10 @@ def _log_transcription_samples(
         )
 
         logger.info("  Output tokens (%d):", len(result["tokens"]))
-        logger.info(f"  Output notes: {len(format_tokens_by_event(result['tokens'], include_program=include_program).splitlines())}")
+        result_format_str = format_tokens_by_event(result["tokens"], include_program=include_program)
+        logger.info(f"  Output notes: {len(result_format_str.splitlines())}")
+        sample = "\n".join(result_format_str.splitlines()[:10])
+        logger.info(f"Sample output tokens:\n{sample}\n...")
        # logger.info("\n%s", format_tokens_by_event(result["tokens"], include_program=include_program))
         logger.info("  Violations: %d/%d", result["violations"], result["total_topk"])
         logger.info("  Saved audio clip: %s", clip_path)

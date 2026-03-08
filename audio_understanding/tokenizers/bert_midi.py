@@ -67,7 +67,7 @@ class BertMIDI:
             assert ids.count(self.tok.unk_token_id) == 0, "Unknown token is not allowed! Please extend the vocabulary!"
 
             # Append special IDs
-            ids = [self.tok.cls_token_id] + ids + [self.tok.sep_token_id]
+            ids = [self.tok.cls_token_id] + ids + [self.tok.sep_token_id] #* for sentence boundary, use <cls> ... <sep>; during decoding, drop <cls> and decode till <sep>
 
             # Pad
             if fix_length:

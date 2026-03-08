@@ -101,7 +101,7 @@ def _cleanup_runtime(accelerator: Accelerator | None) -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-
+#* 目前还不具备
 def main_func(cfg: DictConfig) -> None:
     script_name = Path(__file__).stem
 
