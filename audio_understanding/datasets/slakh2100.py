@@ -528,6 +528,142 @@ class Slakh2100(Dataset):
 
         return data
 
+    def evaluate(
+        self,
+        data: dict,
+        output_tokens: list[str],
+        fps: float,
+        include_program: bool = False,
+    ) -> dict:
+        r"""Evaluate model output tokens against ground truth for one sample.
+
+        Always computes note onset F1 and note-with-offset F1.
+
+        When instrument metadata is available in *data* (i.e. ``"note_program"``
+        is present) and either *include_program* is ``True`` or the sample
+        targets a single instrument (X2one setting such as ``all2one`` /
+        ``single`` mode), program-aware F1 and per-instrument metrics are also
+        returned.
+
+        **Modes without instrument prediction** (e.g. ``all``/``all2all``,
+        ``rand_mix``): pass ``include_program=False``.  Only onset and offset
+        F1 are returned.
+
+        **Modes with instrument prediction** (``include_program=True``): the
+        model output tokens contain ``program=X`` fields.  Program-aware F1
+        and per-instrument metrics are returned.
+
+        **X2one modes** (``all2one`` / ``single``): the model does not predict
+        instrument labels, but the ground truth always targets a single
+        instrument whose identity is known from the dataloader.  This is
+        detected automatically when all reference notes share the same program,
+        and per-instrument metrics are computed by assigning that program to
+        all estimated notes.
+
+        Args:
+            data: dict returned by :meth:`__getitem__` (must contain ``"note"``,
+                ``"start_time"``, and—for per-instrument evaluation—
+                ``"note_program"`` and ``"note_is_drum"``).  The ``"note"``
+                value should be a list of Note objects (use ``MIDI2Tokens`` or
+                ``target_transform=None`` when creating the dataset).
+            output_tokens: flat list of MIDI token strings produced by the
+                model.
+            fps: frames per second used when encoding tokens (must match the
+                value used during training).
+            include_program: whether *output_tokens* contain ``program=X``
+                fields.
+
+        Returns:
+            Dict always containing:
+
+            * ``"note_onset"``  – ``{"precision": float, "recall": float, "f1": float}``
+            * ``"note_offset"`` – ``{"precision": float, "recall": float, "f1": float}``
+
+            And, when applicable:
+
+            * ``"program_aware"``  – ``{"precision": float, "recall": float, "f1": float}``
+            * ``"per_instrument"`` – per-instrument onset F1 dict (see
+              :func:`~audio_understanding.eval.transcription.metrics.per_instrument_metrics`)
+        """
+        from audio_understanding.eval.transcription.metrics import (
+            parse_tokens_to_notes,
+            note_onset_f1,
+            note_with_offset_f1,
+            program_aware_f1,
+            per_instrument_metrics,
+        )
+
+        start_time = data["start_time"]
+        notes = data.get("note", [])
+        note_programs = data.get("note_program", [])
+        note_is_drum = data.get("note_is_drum", [])
+        note_inst_class = data.get("note_inst_class", [])
+
+        has_inst_meta = len(note_programs) == len(notes) and len(notes) > 0
+
+        # Build reference note list (times relative to clip start)
+        ref_notes = []
+        for idx, note in enumerate(notes):
+            note_dict: dict = {
+                "onset_time":  note.start - start_time,
+                "offset_time": note.end   - start_time,
+                "pitch":       note.pitch,
+                "velocity":    note.velocity,
+            }
+            if has_inst_meta:
+                note_dict["program"]    = int(note_programs[idx])
+                note_dict["is_drum"]    = bool(note_is_drum[idx])
+                note_dict["inst_class"] = (
+                    note_inst_class[idx] if note_inst_class else "unknown"
+                )
+            ref_notes.append(note_dict)
+
+        # Parse model output tokens into note dicts
+        est_notes = parse_tokens_to_notes(
+            tokens=output_tokens,
+            fps=fps,
+            include_program=include_program,
+            start_time=0.0,
+        )
+
+        results = {
+            "note_onset":  note_onset_f1(ref_notes, est_notes),
+            "note_offset": note_with_offset_f1(ref_notes, est_notes),
+        }
+
+        # Detect X2one scenario: model has no program output but ground truth
+        # targets exactly one instrument — assign that program to all estimates.
+        single_program: Optional[int] = None
+        single_is_drum: bool = False
+        if has_inst_meta and not include_program:
+            unique_non_drum_progs = set(
+                int(p)
+                for p, d in zip(note_programs, note_is_drum)
+                if not d
+            )
+            all_drum = all(bool(d) for d in note_is_drum)
+            if len(unique_non_drum_progs) == 1 or (
+                len(unique_non_drum_progs) == 0 and all_drum
+            ):
+                single_program = int(note_programs[0])
+                single_is_drum = bool(note_is_drum[0])
+
+        if include_program or single_program is not None:
+            if single_program is not None and not include_program:
+                # Assign the known single program to all estimated notes
+                est_notes_prog = [
+                    {**n, "program": single_program, "is_drum": single_is_drum}
+                    for n in est_notes
+                ]
+            else:
+                est_notes_prog = est_notes
+
+            results["program_aware"]  = program_aware_f1(ref_notes, est_notes_prog)
+            results["per_instrument"] = per_instrument_metrics(ref_notes, est_notes_prog)
+
+        return results
+
+
 '''
 from audidata.transforms.midi import ReductToPianoRoll
 
