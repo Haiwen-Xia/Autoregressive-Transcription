@@ -358,18 +358,22 @@ class Slakh2100(Dataset):
                     instruments.append("{} (program {})".format(stem_data["inst_class"], stem_data["program_num"]))
             random.shuffle(instruments)
             if instru_dropout:
-                target_length = random.randint(1, len(instruments))
+                rand_target_length = random.randint(1, len(instruments))
             else:
-                target_length = len(instruments)
-            targets = ", ".join(instruments[:target_length])
+                rand_target_length = len(instruments)
+                
+            rand_target_length = random.randint(1, len(instruments))
+
+            rand_targets = ", ".join(instruments[:rand_target_length])
+            targets = ", ".join(instruments)
             if question_template is not None:
                 question = question_template.format(targets=targets)
                 return {"question": question}
 
-            if self.mode in ["all2several", "all2one", "mix2one"]:
+            if self.mode in ["all2several", "all2one", "mix2one"]: #* since here is to transcribe mixes only, ...
                 question = "Transcribe only the target instruments from this audio. Target instruments: {}.".format(targets)
             else:
-                question = "Transcribe this audio. Target instruments may include: {}.".format(targets)
+                question = "Transcribe this audio. Target instruments may include: {}.".format(rand_targets)
 
         return {"question": question}
     
