@@ -329,7 +329,7 @@ class Slakh2100(Dataset):
             return input_ids, target_ids
 
         if self.mode == "rand_mix":
-            sample_n = min(self.sample_num, len(all_track_ids))
+            sample_n = random.randint(1, min(self.sample_num, len(all_track_ids)))
             chosen = sorted(random.sample(all_track_ids, sample_n))
             return chosen, chosen
 
