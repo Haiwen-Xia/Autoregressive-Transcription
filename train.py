@@ -135,6 +135,10 @@ def main_func(cfg: DictConfig) -> None:
         ckpt_path=configs["train"]["resume_ckpt_path"],
     ).to(device)
 
+    # Learnable parameters
+    params = get_learnable_params(configs, audio_encoder, llm)
+    optimizer, scheduler = get_optimizer_and_scheduler(configs=configs, params=params)
+    
     audio_total, audio_trainable = _count_model_params(audio_encoder)
     llm_total, llm_trainable = _count_model_params(llm)
     logger.info(
@@ -144,9 +148,7 @@ def main_func(cfg: DictConfig) -> None:
         llm_total // 1024**2,
         llm_trainable // 1024**2,
     )
-    # Learnable parameters
-    params = get_learnable_params(configs, audio_encoder, llm)
-    optimizer, scheduler = get_optimizer_and_scheduler(configs=configs, params=params)
+    
     gradient_accumulation = configs["train"]["gradient_accumulation"] if "gradient_accumulation" in configs["train"] else 1
     assert gradient_accumulation > 0
     global_step = 0
@@ -511,7 +513,8 @@ def get_dataset(
 
 def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
     r"""Load pretrained audio encoder."""
-
+    if "ckpt_path" not in configs["audio_encoder"]:
+        configs["audio_encoder"]["ckpt_path"] = None
     name = configs["audio_encoder"]["name"]
     sr = configs["sample_rate"]
     trainable = configs["audio_encoder"]["trainable"]
@@ -532,9 +535,13 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
 
         model = PannsCnn14(sr=sr, trainable=trainable)
 
-    elif name == "Conformer2d":
+    elif name == "Conformer2D":
         from audio_understanding.audio_encoders.conformer2d import Conformer2D
-        model = Conformer2D(sr=sr, trainable=True)
+        model = Conformer2D(sr=sr, trainable=trainable)
+        
+    elif name == "Conformer2D_nopool":
+        from audio_understanding.audio_encoders.conformer2d_nopool import Conformer2D_nopool_slakh
+        model = Conformer2D_nopool_slakh(sr=sr, trainable=True)
 
     elif name == "MERT":
         from audio_understanding.audio_encoders.mert import MERT
@@ -555,9 +562,31 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
     else:
         raise ValueError(name)
 
-    if ckpt_path and configs["audio_encoder"]["trainable"]:
+    for param in model.parameters():
+        param.requires_grad = trainable
+
+    if configs["audio_encoder"]["ckpt_path"]:
+        ckpt = torch.load(configs["audio_encoder"]["ckpt_path"], map_location="cpu")
+        # Filter out keys with mismatched shapes (e.g. rope buffer size differs)
+        model_state = model.state_dict()
+        skipped_shape = {k for k, v in ckpt.items() if k in model_state and v.shape != model_state[k].shape}
+        unexpected = {k for k in ckpt if k not in model_state}
+        missing = {k for k in model_state if k not in ckpt}
+        if skipped_shape:
+            logging.warning("Skipped keys due to shape mismatch: (ckpt, model) %s", {k: (ckpt[k].shape, model_state[k].shape) for k in skipped_shape})
+        if unexpected:
+            logging.warning("Unexpected keys in checkpoint (ignored): %s", unexpected)
+        if missing:
+            logging.warning("Missing keys in checkpoint (using init): %s", missing)
+        filtered_ckpt = {k: v for k, v in ckpt.items() if k in model_state and k not in skipped_shape}
+        model.load_state_dict(filtered_ckpt, strict=False) #* there is no state dict key for audio encoder key 
+        logging.info("Loaded audio encoder weights from %s", configs["audio_encoder"]["ckpt_path"])
+        
+    if ckpt_path:
         ckpt = torch.load(ckpt_path)
-        model.load_state_dict(ckpt["audio_encoder"])
+        if "audio_encoder" in ckpt:
+            model.load_state_dict(ckpt["audio_encoder"])
+            logging.info("Loaded audio encoder weights from joint checkpoint %s", ckpt_path)
 
     return model
 
@@ -587,6 +616,9 @@ def get_llm(configs: dict, audio_latent_dim: int, vocab_size: int, ckpt_path: st
     r"""Initialize LLM decoder."""
 
     name = configs["llm"]["name"]
+    if "ckpt_path" not in configs["llm"]:
+        configs["llm"]["ckpt_path"] = None
+    trainable = configs["llm"]["trainable"]
 
     if name == "Llama":
         from audio_understanding.llm.llama import Llama, LlamaConfig
@@ -609,9 +641,29 @@ def get_llm(configs: dict, audio_latent_dim: int, vocab_size: int, ckpt_path: st
     else:
         raise ValueError(name)
 
-    if ckpt_path and configs["llm"]["trainable"]:
+    for param in model.parameters():
+        param.requires_grad = trainable
+
+    if configs["llm"]["ckpt_path"]:
+        ckpt = torch.load(configs["llm"]["ckpt_path"], map_location="cpu")
+        model_state = model.state_dict()
+        skipped_shape = {k for k, v in ckpt.items() if k in model_state and v.shape != model_state[k].shape}
+        unexpected = {k for k in ckpt if k not in model_state}
+        missing = {k for k in model_state if k not in ckpt}
+        if skipped_shape:
+            logging.warning("LLM skipped keys due to shape mismatch: %s", {k: (ckpt[k].shape, model_state[k].shape) for k in skipped_shape})
+        if unexpected:
+            logging.warning("LLM unexpected keys in checkpoint (ignored): %s", unexpected)
+        if missing:
+            logging.warning("LLM missing keys in checkpoint (using init): %s", missing)
+        filtered_ckpt = {k: v for k, v in ckpt.items() if k in model_state and k not in skipped_shape}
+        model.load_state_dict(filtered_ckpt, strict=False) #* there is no state dict key for llm key 
+        logging.info("Loaded LLM weights from %s", configs["llm"]["ckpt_path"])
+    if ckpt_path:
         ckpt = torch.load(ckpt_path)
-        model.load_state_dict(ckpt["llm"])
+        if "llm" in ckpt:
+            model.load_state_dict(ckpt["llm"])
+            logging.info("Loaded LLM weights from joint checkpoint %s", ckpt_path)
 
     return model
 
