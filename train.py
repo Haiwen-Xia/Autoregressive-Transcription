@@ -518,7 +518,7 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
     name = configs["audio_encoder"]["name"]
     sr = configs["sample_rate"]
     trainable = configs["audio_encoder"]["trainable"]
-
+    use_decoder = configs["audio_encoder"].get("use_decoder", True)
     if name == "Whisper":
         from audio_understanding.audio_encoders.whisper import Whisper
 
@@ -537,11 +537,11 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
 
     elif name == "Conformer2D":
         from audio_understanding.audio_encoders.conformer2d import Conformer2D
-        model = Conformer2D(sr=sr, trainable=trainable)
+        model = Conformer2D(sr=sr, trainable=trainable, use_decoder=use_decoder)
         
     elif name == "Conformer2D_nopool":
-        from audio_understanding.audio_encoders.conformer2d_nopool import Conformer2D_nopool_slakh
-        model = Conformer2D_nopool_slakh(sr=sr, trainable=True)
+        from audio_understanding.audio_encoders.conformer2d_nopool import Conformer2D
+        model = Conformer2D(sr=sr, trainable=trainable, use_decoder=use_decoder)
 
     elif name == "MERT":
         from audio_understanding.audio_encoders.mert import MERT
