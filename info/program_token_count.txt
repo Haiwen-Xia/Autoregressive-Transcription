@@ -1,0 +1,42 @@
+Program | Instrument | Count
+----------------------------------
+  0 | Acoustic Grand Piano      | 484754
+ 25 | Acoustic Guitar (steel)   | 156025
+  1 | Bright Acoustic Piano     | 82395
+ 27 | Electric Guitar (clean)   | 60929
+ 33 | Electric Bass (finger)    | 52863
+ 28 | Electric Guitar (muted)   | 43916
+  4 | Electric Piano 1          | 39838
+ 35 | Fretless Bass             | 37351
+  5 | Electric Piano 2          | 33113
+ 48 | String Ensemble 1         | 30197
+ 29 | Overdriven Guitar         | 28303
+ 24 | Acoustic Guitar (nylon)   | 24493
+ 26 | Electric Guitar (jazz)    | 23681
+ 30 | Distortion Guitar         | 19564
+  2 | Electric Grand Piano      | 14001
+ 52 | Choir Aahs                | 13915
+ 18 | Rock Organ                | 12950
+ 53 | Voice Oohs                | 12331
+  7 | Clavinet                  | 11906
+ 61 | Brass Section             | 11035
+ 49 | String Ensemble 2         | 10853
+ 38 | Synth Bass 1              | 8878
+  3 | Honky-tonk Piano          | 8735
+  6 | Harpsichord               | 8348
+ 65 | Alto Sax                  | 8108
+ 39 | Synth Bass 2              | 8087
+ 34 | Electric Bass (pick)      | 7941
+ 50 | Synth Strings 1           | 7800
+ 73 | Flute                     | 6673
+ 82 | Lead 3 (calliope)         | 5561
+ 54 | Synth Choir               | 5460
+ 75 | Pan Flute                 | 5460
+ 62 | Synth Brass 1             | 5364
+ 11 | Vibraphone                | 5065
+ 90 | Pad 3 (polysynth)         | 5042
+ 17 | Percussive Organ          | 4991
+ 22 | Harmonica                 | 4561
+ 87 | Lead 8 (bass + lead)      | 4460
+ 66 | Tenor Sax                 | 4439
+ 12 | Marimba                   | 4127

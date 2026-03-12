@@ -298,6 +298,7 @@ def _log_transcription_samples(
     import soundfile as sf
 
     include_program = configs.get("midi_include_program", False)
+    write_program_tracks = bool(configs.get("midi_write_program_tracks", include_program))
     sr = configs["sample_rate"]
     outputs_dir = output_dir / "outputs" / f"step={step}"
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -337,7 +338,9 @@ def _log_transcription_samples(
         gt_midi_path = str(outputs_dir / f"sample_{idx}_gt.mid")
         if gt_tokens:
             tokens_to_midi(tokens=gt_tokens, fps=configs["fps"],
-                           output_path=gt_midi_path, include_program=include_program)
+                           output_path=gt_midi_path,
+                           include_program=include_program,
+                           write_program_tracks=write_program_tracks)
 
         # Run constrained decoding
         midi_out_path = str(outputs_dir / f"sample_{idx}.mid")
@@ -367,7 +370,8 @@ def _log_transcription_samples(
 
 def get_dataset(
     configs: dict, 
-    split: str
+    split: str,
+    use_crop: bool = True,
 ) -> Dataset:
     r"""Get datasets."""
 
@@ -389,7 +393,7 @@ def get_dataset(
                 root=configs[datasets_split][name]["root"],
                 split=configs[datasets_split][name]["split"],
                 sr=sr,
-                crop=RandomCrop(clip_duration=clip_duration),
+                crop=RandomCrop(clip_duration=clip_duration) if use_crop else None,
                 transform=Mono(),
             )
             datasets.append(dataset)
@@ -401,7 +405,7 @@ def get_dataset(
                 root=configs[datasets_split][name]["root"],
                 split=configs[datasets_split][name]["split"],
                 sr=sr,
-                crop=StartCrop(clip_duration=clip_duration),
+                crop=StartCrop(clip_duration=clip_duration) if use_crop else None,
                 transform=[Mono(), TimeShift(sr=sr, shift=(0.0, 0.5))],
             )
             datasets.append(dataset)
@@ -413,7 +417,7 @@ def get_dataset(
                 root=configs[datasets_split][name]["root"],
                 split=configs[datasets_split][name]["split"],
                 sr=sr,
-                crop=StartCrop(clip_duration=clip_duration),
+                crop=StartCrop(clip_duration=clip_duration) if use_crop else None,
                 transform=[Mono(), TimeShift(sr=sr, shift=(0.0, 0.5))],
                 target_transform=TextNormalization(),
             )
@@ -432,7 +436,7 @@ def get_dataset(
                 root=configs[datasets_split][name]["root"],
                 split=configs[datasets_split][name]["split"],
                 sr=sr,
-                crop=RandomCrop(clip_duration=clip_duration, end_pad=clip_duration - 0.1),
+                crop=RandomCrop(clip_duration=clip_duration, end_pad=clip_duration - 0.1) if use_crop else None,
                 transform=Mono(),
                 load_target=True,
                 extend_pedal=True,
@@ -459,7 +463,7 @@ def get_dataset(
                 root=dataset_config["root"],
                 split=dataset_config["split"],
                 sr=sr,
-                crop=RandomCrop(clip_duration=clip_duration, end_pad=clip_duration - 0.1),
+                crop=RandomCrop(clip_duration=clip_duration, end_pad=clip_duration - 0.1) if use_crop else None,
                 transform=Mono(),
                 target=True,
                 extend_pedal=True,
@@ -478,7 +482,7 @@ def get_dataset(
                 root=configs[datasets_split][name]["root"],
                 split=configs[datasets_split][name]["split"],
                 sr=sr,
-                crop=StartCrop(clip_duration=clip_duration),
+                crop=StartCrop(clip_duration=clip_duration) if use_crop else None,
                 transform=Mono(),
                 target_transform=TextNormalization(),
             )
@@ -490,7 +494,7 @@ def get_dataset(
             dataset = WavCaps(
                 root=configs[datasets_split][name]["root"],
                 sr=sr,
-                crop=StartCrop(clip_duration=clip_duration),
+                crop=StartCrop(clip_duration=clip_duration) if use_crop else None,
                 transform=Mono(),
                 target_transform=TextNormalization(),
             )

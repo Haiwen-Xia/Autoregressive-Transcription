@@ -21,6 +21,7 @@ from audio_understanding.data.samplers import InfiniteSampler
 from audio_understanding.utils import remove_padded_columns
 from train import (
     ce_loss,
+    format_tokens_by_event,
     get_audio_encoder,
     get_audio_question_answering,
     get_dataset,
@@ -28,6 +29,8 @@ from train import (
     get_llm,
     get_optimizer_and_scheduler,
     get_tokenizer,
+    tokens_to_midi,
+    transcribe_audio,
     validate,
 )
 
@@ -100,6 +103,90 @@ def _cleanup_runtime(accelerator: Accelerator | None) -> None:
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _log_transcription_samples(
+    configs: dict,
+    dataset,
+    audio_encoder,
+    tokenizer,
+    llm,
+    output_dir: Path,
+    step: int,
+    logger: logging.Logger,
+    device,
+    n_samples: int = 2,
+) -> None:
+    """Pick n_samples from dataset, run constrained decoding, and log results."""
+    import soundfile as sf
+
+    include_program = configs.get("midi_include_program", False)
+    write_program_tracks = bool(configs.get("midi_write_program_tracks", include_program))
+    sr = configs["sample_rate"]
+    outputs_dir = output_dir / "outputs" / f"step={step}"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    skip_n = max(1, len(dataset) // n_samples)
+    sample_indices = list(range(0, len(dataset), skip_n))[:n_samples]
+
+    for idx in sample_indices:
+        data = dataset[idx]
+        audio_path = data.get("audio_path", "unknown")
+        midi_path = data.get("midi_path", "unknown")
+        question = data.get("question", "Music transcription.")
+        gt_tokens = data.get("token", [])
+
+        logger.info("=== Transcription sample idx=%d step=%d ===", idx, step)
+        logger.info("  audio_path: %s", audio_path)
+        logger.info("  midi_path:  %s", midi_path)
+        logger.info("  question:   %s", question)
+        logger.info("  GT tokens (%d):", len(gt_tokens))
+        format_str = format_tokens_by_event(gt_tokens, include_program=include_program)
+        logger.info("  GT notes: %d", len(format_str.splitlines()))
+        sample = "\n".join(format_str.splitlines()[:10])
+        logger.info("Sample GT tokens:\n%s\n...", sample)
+
+        audio = data["audio"]
+        if not isinstance(audio, torch.Tensor):
+            audio = torch.Tensor(audio)
+        audio_tensor = audio.unsqueeze(0).to(device)
+
+        clip_path = outputs_dir / f"sample_{idx}.wav"
+        audio_np = audio.squeeze().cpu().numpy()
+        sf.write(str(clip_path), audio_np, sr)
+
+        gt_midi_path = str(outputs_dir / f"sample_{idx}_gt.mid")
+        if gt_tokens:
+            tokens_to_midi(
+                tokens=gt_tokens,
+                fps=configs["fps"],
+                output_path=gt_midi_path,
+                include_program=include_program,
+                write_program_tracks=write_program_tracks,
+            )
+
+        midi_out_path = str(outputs_dir / f"sample_{idx}.mid")
+        result = transcribe_audio(
+            audio_encoder=audio_encoder,
+            llm=llm,
+            tokenizer=tokenizer,
+            audio_tensor=audio_tensor,
+            configs=configs,
+            output_midi_path=midi_out_path,
+            question=question,
+            temperature=1.0,
+            top_k=1,
+        )
+
+        logger.info("  Output tokens (%d):", len(result["tokens"]))
+        result_format_str = format_tokens_by_event(result["tokens"], include_program=include_program)
+        logger.info("  Output notes: %d", len(result_format_str.splitlines()))
+        sample = "\n".join(result_format_str.splitlines()[:10])
+        logger.info("Sample output tokens:\n%s\n...", sample)
+        logger.info("  Violations: %d/%d", result["violations"], result["total_topk"])
+        logger.info("  Saved audio clip: %s", clip_path)
+        logger.info("  Saved GT MIDI: %s", gt_midi_path)
+        logger.info("  Saved output MIDI: %s", midi_out_path)
 
 #* 目前还不具备
 def main_func(cfg: DictConfig) -> None:
@@ -262,6 +349,8 @@ def main_func(cfg: DictConfig) -> None:
 
             if step % 100 == 0 and accelerator.is_main_process:
                 logger.info("Step: %d, Loss: %.6f", step, loss.item())
+                if wandb_log:
+                    wandb.log(data={"train_loss_step": loss.item()}, step=step)
 
             if step > 0 and step % configs["train"]["test_every_n_steps"] == 0 and accelerator.is_main_process:
                 train_loss = validate(
@@ -301,6 +390,20 @@ def main_func(cfg: DictConfig) -> None:
 
                 torch.save(ckpt, ckpt_path)
                 logger.info("Save model to %s", ckpt_path)
+
+            if step * 10 % configs["train"]["save_every_n_steps"] == 0 and accelerator.is_main_process:
+                _log_transcription_samples(
+                    configs=configs,
+                    dataset=test_dataset,
+                    audio_encoder=_unwrap(audio_encoder, accelerator),
+                    tokenizer=tokenizer,
+                    llm=_unwrap(llm, accelerator),
+                    output_dir=output_dir,
+                    step=step,
+                    logger=logger,
+                    device=audio_latent.device,
+                    n_samples=2,
+                )
 
             if step == configs["train"]["training_steps"]:
                 break

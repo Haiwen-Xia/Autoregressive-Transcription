@@ -1,0 +1,42 @@
+Program | Instrument | Count
+----------------------------------
+128 | Drums                     | 1289
+ 25 | Acoustic Guitar (steel)   | 814
+ 48 | String Ensemble 1         | 671
+ 33 | Electric Bass (finger)    | 654
+ 27 | Electric Guitar (clean)   | 578
+ 29 | Overdriven Guitar         | 528
+  1 | Bright Acoustic Piano     | 525
+ 35 | Fretless Bass             | 517
+  0 | Acoustic Grand Piano      | 426
+ 52 | Choir Aahs                | 407
+  4 | Electric Piano 1          | 402
+ 26 | Electric Guitar (jazz)    | 392
+ 28 | Electric Guitar (muted)   | 384
+  5 | Electric Piano 2          | 378
+ 30 | Distortion Guitar         | 371
+ 49 | String Ensemble 2         | 359
+ 24 | Acoustic Guitar (nylon)   | 245
+ 61 | Brass Section             | 244
+ 53 | Voice Oohs                | 229
+ 65 | Alto Sax                  | 204
+ 50 | Synth Strings 1           | 201
+ 73 | Flute                     | 172
+ 18 | Rock Organ                | 169
+ 54 | Synth Choir               | 133
+ 88 | Pad 1 (new age)           | 132
+  2 | Electric Grand Piano      | 128
+ 11 | Vibraphone                | 110
+ 81 | Lead 2 (sawtooth)         | 108
+  7 | Clavinet                  | 103
+ 89 | Pad 2 (warm)              | 102
+ 66 | Tenor Sax                 | 97
+ 75 | Pan Flute                 | 95
+ 90 | Pad 3 (polysynth)         | 94
+ 34 | Electric Bass (pick)      | 91
+ 82 | Lead 3 (calliope)         | 90
+  3 | Honky-tonk Piano          | 88
+ 17 | Percussive Organ          | 85
+ 57 | Trombone                  | 85
+ 56 | Trumpet                   | 81
+  6 | Harpsichord               | 80

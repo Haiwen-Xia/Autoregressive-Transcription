@@ -1,7 +1,7 @@
-datasets/
 wandb/
 __pycache__/
-
+no_log/
+/datasets/
 maestro/
 slakh/
 outputs/
