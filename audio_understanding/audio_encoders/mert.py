@@ -6,6 +6,7 @@ import torchaudio
 from transformers import AutoModel, Wav2Vec2FeatureExtractor
 
 
+#* fps: 75
 class MERT(nn.Module):
 
     def __init__(

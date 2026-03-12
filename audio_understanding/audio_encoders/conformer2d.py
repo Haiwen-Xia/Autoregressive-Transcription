@@ -58,6 +58,7 @@ class Conformer2D(Fourier):
             normalized=True,
         )
         # Two downsampling blocks here, 4 times of downsample
+        #! 
         self.conv1 = ConvBlock(in_channels=1, out_channels=32)
         self.conv2 = ConvBlock(in_channels=32, out_channels=64)
 

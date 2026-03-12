@@ -8,7 +8,7 @@ from piano_transcription_inference import PianoTranscription
 from piano_transcription_inference.models import Regress_onset_offset_frame_velocity_CRNN
 
 
-class PianoTranscriptionCRnn(nn.Module):
+class PianoTranscriptionCRnn(nn.Module): #! 精度
 
     def __init__(self, sr: float, trainable: bool, random: bool=False) -> None:
         r"""Piano transcription encoder [1]

@@ -48,16 +48,25 @@ class MIDI2Tokens:
 
             elif (start_time <= note.start <= end_time) and (start_time <= note.end <= end_time):
 
+                onset_idx = round((note.start - start_time) * self.fps)
+                offset_idx = round((note.end - start_time) * self.fps)
+                # Ensure offset comes after onset in the token sequence.
+                # When they fall on the same frame (zero-duration notes, common
+                # for drums), the sort key would place offset before onset,
+                # breaking the parser's open-note matching.
+                if offset_idx <= onset_idx:
+                    offset_idx = onset_idx + 1
+
                 events.append([
                     "name=note_onset",
-                    "time_index={}".format(round((note.start - start_time) * self.fps)),
+                    "time_index={}".format(onset_idx),
                     "pitch={}".format(note.pitch),
                     "velocity={}".format(note.velocity)
                 ] + program_token)
 
                 events.append([
                     "name=note_offset",
-                    "time_index={}".format(round((note.end - start_time) * self.fps)),
+                    "time_index={}".format(offset_idx),
                     "pitch={}".format(note.pitch),
                 ] + program_token)
 
