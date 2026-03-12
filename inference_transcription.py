@@ -110,8 +110,10 @@ def transcribe_audio(
     midi_path = None
     if output_midi_path is not None:
         fps = configs["fps"]
+        write_program_tracks = bool(configs.get("midi_write_program_tracks", include_program))
         tokens_to_midi(tokens=tokens, fps=fps, output_path=output_midi_path,
-                       include_program=include_program)
+                       include_program=include_program,
+                       write_program_tracks=write_program_tracks)
         midi_path = output_midi_path
 
     return {
@@ -168,6 +170,7 @@ def tokens_to_midi(
     fps: float,
     output_path: str,
     include_program: bool = False,
+    write_program_tracks: bool = False,
 ) -> None:
     """Convert generated token list to a MIDI file.
 
@@ -175,7 +178,7 @@ def tokens_to_midi(
         note_onset:  name=note_onset, time_index=X, pitch=X, velocity=X [, program=X]
         note_offset: name=note_offset, time_index=X, pitch=X [, program=X]
     """
-    note_dict: dict[int, list[dict]] = {p: [] for p in range(128)}
+    note_dict: dict[tuple[int, int], list[dict]] = {}
     n = len(tokens)
     i = 0
 
@@ -195,10 +198,19 @@ def tokens_to_midi(
             time_index = int(tokens[i + 1].split("=")[1])
             pitch = int(tokens[i + 2].split("=")[1])
             velocity = int(tokens[i + 3].split("=")[1])
-            note = {"onset_time_index": time_index, "pitch": pitch, "velocity": velocity}
+            program = 0
             if include_program:
-                note["program"] = int(tokens[i + 4].split("=")[1])
-            note_dict[pitch].append(note)
+                program = int(tokens[i + 4].split("=")[1])
+            note = {
+                "onset_time_index": time_index,
+                "pitch": pitch,
+                "velocity": velocity,
+                "program": program,
+            }
+            key_pitch_program = (pitch, program)
+            if key_pitch_program not in note_dict:
+                note_dict[key_pitch_program] = []
+            note_dict[key_pitch_program].append(note)
             i += event_len
             continue
 
@@ -209,35 +221,62 @@ def tokens_to_midi(
                 break
             time_index = int(tokens[i + 1].split("=")[1])
             pitch = int(tokens[i + 2].split("=")[1])
-            if len(note_dict[pitch]) > 0:
-                note_dict[pitch][-1]["offset_time_index"] = time_index
+            program = 0
+            if include_program:
+                program = int(tokens[i + 3].split("=")[1])
+            key_pitch_program = (pitch, program)
+
+            if key_pitch_program in note_dict and len(note_dict[key_pitch_program]) > 0:
+                note_dict[key_pitch_program][-1]["offset_time_index"] = time_index
             i += event_len
             continue
 
         i += 1
 
     # Collect all notes
-    events = []
-    for p in note_dict:
-        events += note_dict[p]
-
-    # Write MIDI
-    track = pretty_midi.Instrument(program=0)
-    track.is_drum = False
-
-    for e in events:
-        start_time = e["onset_time_index"] / fps
-        end_time = e.get("offset_time_index", e["onset_time_index"] + int(fps * 0.1)) / fps
-        note = pretty_midi.Note(
-            pitch=e["pitch"],
-            start=start_time,
-            end=end_time,
-            velocity=e["velocity"],
-        )
-        track.notes.append(note)
-
     midi_data = pretty_midi.PrettyMIDI()
-    midi_data.instruments.append(track)
+
+    if write_program_tracks and include_program:
+        track_dict: dict[int, pretty_midi.Instrument] = {}
+        for (_, _), events in note_dict.items():
+            for e in events:
+                program = int(e.get("program", 0))
+                if program not in track_dict:
+                    is_drum = program == 128
+                    track_program = 0 if is_drum else max(0, min(127, program))
+                    instrument = pretty_midi.Instrument(program=track_program)
+                    instrument.is_drum = is_drum
+                    track_dict[program] = instrument
+
+                start_time = e["onset_time_index"] / fps
+                end_time = e.get("offset_time_index", e["onset_time_index"] + int(fps * 0.1)) / fps
+                note = pretty_midi.Note(
+                    pitch=e["pitch"],
+                    start=start_time,
+                    end=end_time,
+                    velocity=e["velocity"],
+                )
+                track_dict[program].notes.append(note)
+
+        for program in sorted(track_dict):
+            midi_data.instruments.append(track_dict[program])
+
+    else:
+        track = pretty_midi.Instrument(program=0)
+        track.is_drum = False
+        for (_, _), events in note_dict.items():
+            for e in events:
+                start_time = e["onset_time_index"] / fps
+                end_time = e.get("offset_time_index", e["onset_time_index"] + int(fps * 0.1)) / fps
+                note = pretty_midi.Note(
+                    pitch=e["pitch"],
+                    start=start_time,
+                    end=end_time,
+                    velocity=e["velocity"],
+                )
+                track.notes.append(note)
+        midi_data.instruments.append(track)
+
     midi_data.write(output_path)
     print("Write out to {}".format(output_path))
 

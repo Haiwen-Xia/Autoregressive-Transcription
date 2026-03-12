@@ -54,6 +54,7 @@ class MIDI2Tokens:
                 # When they fall on the same frame (zero-duration notes, common
                 # for drums), the sort key would place offset before onset,
                 # breaking the parser's open-note matching.
+                #! this only works on segment handling and should be removed in the future. Theoretically, zero-duration notes CAN BE detected.
                 if offset_idx <= onset_idx:
                     offset_idx = onset_idx + 1
 

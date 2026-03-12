@@ -34,7 +34,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 ONSET_TOL: float = 0.05       # 50 ms onset tolerance
-OFFSET_RATIO: float = 0.2     # offset tolerance = max(OFFSET_MIN_TOL, ratio × duration)
+OFFSET_RATIO: float = 0.2     # offset tolerance = max(OFFSET_MIN_TOL, ratio × reference_duration)
 OFFSET_MIN_TOL: float = 0.05  # 50 ms minimum offset tolerance
 
 #: Sentinel program value used to represent drums (channel 9 / is_drum=True).
@@ -46,11 +46,14 @@ DRUM_PROGRAM: int = 128
 # Token parsing
 # ---------------------------------------------------------------------------
 
+# 这个parsing的补全对于segment/ continous 都可以
 def parse_tokens_to_notes(
     tokens: list[str],
     fps: float,
     include_program: bool = False,
     start_time: float = 0.0,
+    clip_duration: Optional[float] = None,
+    exclude_boundary: bool = False,
 ) -> list[dict]:
     r"""Parse a MIDI token sequence into a list of note event dicts.
 
@@ -67,19 +70,23 @@ def parse_tokens_to_notes(
             from clip start).
         include_program: whether ``program=X`` tokens appear in each event.
         start_time: absolute clip start time added to all output times.
+        clip_duration: optional clip duration in seconds. When provided,
+            onset-only notes are closed at ``start_time + clip_duration``.
 
     Returns:
         List of note dicts.  Each dict contains:
 
         * ``onset_time``  – float, absolute seconds
-        * ``offset_time`` – float, absolute seconds (defaults to
-          ``onset_time + 0.1`` when no matching offset token is found)
+                * ``offset_time`` – float, absolute seconds (defaults to
+                    ``start_time + clip_duration`` when provided, otherwise
+                    ``onset_time + 0.1`` when no matching offset token is found)
         * ``pitch``       – int 0-127
         * ``velocity``    – int 0-127
         * ``program``     – int 0-127 (only when *include_program* is True)
     """
-    # open_notes maps pitch → list of onset dicts awaiting a matching offset
-    open_notes: dict[int, list[dict]] = {}
+    # open_notes maps key -> list of onset dicts awaiting a matching offset.
+    # key is pitch when include_program=False, otherwise (pitch, program).
+    open_notes: dict[object, list[dict]] = {}
     finished: list[dict] = []
     n = len(tokens)
     i = 0
@@ -114,7 +121,10 @@ def parse_tokens_to_notes(
                     note["program"] = int(tokens[i + 4].split("=")[1])
                 except (ValueError, IndexError):
                     note["program"] = 0
-            open_notes.setdefault(pitch, []).append(note)
+            open_key: object = pitch
+            if include_program:
+                open_key = (pitch, int(note["program"]))
+            open_notes.setdefault(open_key, []).append(note)
             i += event_len
             continue
 
@@ -128,20 +138,59 @@ def parse_tokens_to_notes(
             except (ValueError, IndexError):
                 i += 1
                 continue
-            if open_notes.get(pitch):
-                note = open_notes[pitch].pop(0)
-                note["offset_time"] = start_time + time_index / fps
+            close_key: object = pitch
+            if include_program:
+                try:
+                    close_program = int(tokens[i + 3].split("=")[1])
+                except (ValueError, IndexError):
+                    close_program = 0
+                close_key = (pitch, close_program)
+
+            if open_notes.get(close_key):
+                # Match offset to the earliest unmatched same-pitch onset (queue/FIFO).
+                # FIFO is correct for sequential overlapping notes (common in
+                # piano with sustain pedal): onset_A, onset_B, offset_A, offset_B.
+                note = open_notes[close_key].pop(0)
+                off_time = start_time + time_index / fps
+                #! clip only Ensure strictly positive duration (mirrors MIDI2Tokens bump)
+                if off_time <= note["onset_time"]:
+                    off_time = note["onset_time"] + 1.0 / fps
+                note["offset_time"] = off_time
                 finished.append(note)
+            else:
+                # Handle left-clipped notes represented by offset-only events.
+                # MIDI2Tokens can emit note_offset without note_onset when
+                # note.start < clip_start <= note.end.
+                if not exclude_boundary:
+                    off_time = start_time + time_index / fps
+                    #! clip only Skip if offset lands on clip start (zero-duration)
+                    if off_time <= start_time:
+                        i += event_len
+                        continue
+                    note = {
+                        "onset_time": start_time,
+                        "offset_time": off_time,
+                        "pitch": pitch,
+                        "velocity": 0,
+                    }
+                    if include_program:
+                        note["program"] = int(close_program)
+                    finished.append(note)
             i += event_len
             continue
 
         i += 1
 
     # Close any notes that never received a matching offset token
-    for pitch_notes in open_notes.values():
-        for note in pitch_notes:
-            note["offset_time"] = note["onset_time"] + 0.1  # 100 ms default
-            finished.append(note)
+    if not exclude_boundary:
+        for pitch_notes in open_notes.values():
+            for note in pitch_notes:
+                if clip_duration is not None:
+                    # Quantize to fps grid for consistency with token-derived times
+                    note["offset_time"] = start_time + round(float(clip_duration) * fps) / fps
+                else:
+                    note["offset_time"] = note["onset_time"] + 0.1  # 100 ms default
+                finished.append(note)
 
     return finished
 
@@ -162,7 +211,7 @@ def _prf(tp: int, n_ref: int, n_est: int) -> dict:
     return {"precision": precision, "recall": recall, "f1": f1}
 
 
-def _effective_program(note: dict) -> int:
+def _effective_program(note: dict) -> int: #* when program is missing, default to 0, therefore can compute program-aware metrics even when program info is not provided
     r"""Return the program number to use for matching.
 
     Drums (``is_drum=True``) are mapped to :data:`DRUM_PROGRAM` regardless of
@@ -221,9 +270,10 @@ def _match_greedy(
                 if _effective_program(ref) != _effective_program(est):
                     continue
 
-            # Offset tolerance
+            # Offset tolerance follows the transcription standard:
+            # |offset_diff| <= max(0.2 * reference_duration, 50 ms)
             if check_offset:
-                ref_dur = ref["offset_time"] - ref["onset_time"]
+                ref_dur = max(0.0, ref["offset_time"] - ref["onset_time"])
                 off_tol = max(offset_min_tol, offset_ratio * ref_dur)
                 if abs(ref["offset_time"] - est["offset_time"]) > off_tol:
                     continue
@@ -283,7 +333,7 @@ def note_with_offset_f1(
     r"""Note-with-offset precision / recall / F1.
 
     A match requires identical pitch, onset within *onset_tol*, and offset
-    within ``max(offset_min_tol, offset_ratio × note_duration)``.
+    within ``max(offset_min_tol, offset_ratio × reference_duration)``.
 
     Args:
         ref_notes: reference note dicts with ``onset_time``, ``offset_time``,
@@ -344,6 +394,7 @@ def per_instrument_metrics(
     onset_tol: float = ONSET_TOL,
 ) -> dict:
     r"""Per-instrument note onset F1 grouped by MIDI program.
+    This only works when the model predicts program or if it only predicts a single program
 
     Notes are grouped by their effective program (see :func:`_effective_program`).
     Drums (``is_drum=True``) are aggregated under the :data:`DRUM_PROGRAM`
