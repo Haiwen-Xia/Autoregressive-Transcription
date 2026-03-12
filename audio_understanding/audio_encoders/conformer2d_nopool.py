@@ -77,7 +77,7 @@ class Conformer2D(Fourier):
         self.train_mode = trainable
         self.latent_dim = config.n_embd
         self.use_decoder = use_decoder
-
+        
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.n_layer))
@@ -192,11 +192,11 @@ class ConvBlock(nn.Module):
             x: (b, c, t, f)
 
         Returns:
-            x: (b, c, t/2, f/2)
+            x: (b, c, t, f/2)
         """
 
         x = F.relu_(self.bn(self.conv(x)))
-        x = F.avg_pool2d(x, kernel_size=(2, 2))
+        x = F.avg_pool2d(x, kernel_size=(1, 2))
         
         return x 
 
