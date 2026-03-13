@@ -23,11 +23,20 @@ default_collate_fn_map.update({list: collate_list_fn})
 
 
 def load_target_from_mix_midi(
+    meta: dict,
     mixed_midi_path: str,
     start_time: float,
     duration: float,
 ) -> dict:
     midi_tracks = read_multi_track_midi(midi_path=mixed_midi_path)
+    stem_items = [
+        (stem_name, stem_data)
+        for stem_name, stem_data in sorted(meta["stems"].items())
+    ]
+    assert len(stem_items) == len(midi_tracks), (
+        "metadata stems and all_src.mid track count mismatch: "
+        f"{len(stem_items)} vs {len(midi_tracks)}"
+    )
 
     data = {
         "start_time": start_time,
@@ -36,12 +45,13 @@ def load_target_from_mix_midi(
     }
 
     for idx, midi_track in enumerate(midi_tracks):
+        stem_name, stem_data = stem_items[idx]
         track = {
-            "track_name": "mix_track_{:02d}".format(idx),
-            "inst_class": "unknown",
+            "track_name": stem_name,
+            "inst_class": stem_data["inst_class"],
             "is_drum": bool(midi_track["is_drum"]),
-            "plugin_name": "unknown",
-            "program_num": int(midi_track["program"]),
+            "plugin_name": stem_data["plugin_name"],
+            "program_num": 128 if bool(midi_track["is_drum"]) else int(midi_track["program"]),
             "note": midi_track["notes"],
             "pedal": midi_track["pedals"],
         }
@@ -58,7 +68,6 @@ def load_target_from_midi_files(
     duration: float,
     extend_pedal: bool,
 ) -> dict:
-
     data = {
         "start_time": start_time,
         "duration": duration,
@@ -66,7 +75,6 @@ def load_target_from_midi_files(
     }
 
     for stem_name, stem_data in meta["stems"].items():
-
         if stem_name not in track_ids:
             continue
 
@@ -76,7 +84,7 @@ def load_target_from_midi_files(
         inst_class = stem_data["inst_class"]
         is_drum = stem_data["is_drum"]
         plugin_name = stem_data["plugin_name"]
-        program_num = stem_data["program_num"]
+        program_num = 128 if bool(is_drum) else int(stem_data["program_num"])
 
         midi_path = Path(midis_dir, "{}.mid".format(stem_name))
 
@@ -147,6 +155,7 @@ class Slakh2100(Dataset):
         target_transform: Optional[Callable | list[Callable]] = PianoRoll(fps=100, pitches_num=128),
         sample_num: int = 1,
         mode: str = "all",  # options: all/all2all, single, all2one, all2several, mix2one
+        include_drum: bool = True, #* previously the drum pitch and pitch was using the same tokenization
         keep_track_info: bool = False, #* 没啥用
         question_config: Optional[dict] = None,
     ):
@@ -166,9 +175,10 @@ class Slakh2100(Dataset):
             "mix2one", 
             "rand_mix",
         ]
-        assert mode in valid_modes, "Invalid mode!"
+        assert mode in valid_modes, f"Invalid mode: {mode}"
         assert sample_num >= 1
         self.mode = mode
+        self.include_drum = include_drum
         self.sample_num = sample_num
         self.keep_track_info = keep_track_info
         self.question_config = question_config if question_config is not None else {}
@@ -453,6 +463,10 @@ class Slakh2100(Dataset):
         pedal_items = []
 
         for track in data["tracks"]:
+            
+            if not self.include_drum:
+                if track["is_drum"] or track["program_num"] == 128:
+                    continue
             notes = clip_notes(track["note"], data["start_time"], data["duration"])
             pedals = clip_notes(track["pedal"], data["start_time"], data["duration"])
 
@@ -507,6 +521,7 @@ class Slakh2100(Dataset):
 
         if use_mix_source:
             data = load_target_from_mix_midi(
+                meta=meta,
                 mixed_midi_path=mixed_midi_path,
                 start_time=start_time,
                 duration=duration,
@@ -598,6 +613,7 @@ class Slakh2100(Dataset):
         )
 
         start_time = data["start_time"]
+        duration = float(data["duration"])
         notes = data.get("note", [])
         note_programs = data.get("note_program", [])
         note_is_drum = data.get("note_is_drum", [])
@@ -608,9 +624,14 @@ class Slakh2100(Dataset):
         # Build reference note list (times relative to clip start)
         ref_notes = []
         for idx, note in enumerate(notes):
+            #! 写得不够优雅/兼容，按道理应该调用clip notes
+            onset_time = max(0.0, float(note.start - start_time))
+            offset_time = min(duration, float(note.end - start_time))
+            if offset_time < onset_time:
+                continue
             note_dict: dict = {
-                "onset_time":  note.start - start_time,
-                "offset_time": note.end   - start_time,
+                "onset_time": onset_time,
+                "offset_time": offset_time,
                 "pitch":       note.pitch,
                 "velocity":    note.velocity,
             }
@@ -628,13 +649,13 @@ class Slakh2100(Dataset):
             fps=fps,
             include_program=include_program,
             start_time=0.0,
+            clip_duration=duration,
         )
 
         results = {
             "note_onset":  note_onset_f1(ref_notes, est_notes),
             "note_offset": note_with_offset_f1(ref_notes, est_notes),
         }
-
         # Detect X2one scenario: model has no program output but ground truth
         # targets exactly one instrument — assign that program to all estimates.
         single_program: Optional[int] = None

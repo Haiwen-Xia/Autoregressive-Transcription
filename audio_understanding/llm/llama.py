@@ -282,6 +282,76 @@ class Llama(nn.Module):
 
         return seqs
 
+    @torch.no_grad()
+    def generate_constrained_batch(
+        self,
+        seqs: list[torch.Tensor],
+        seq_types: list[str],
+        max_new_ids: int,
+        constraints: list,
+        sep_token_id: int,
+        temperature: float = 1.0,
+        top_k: None | int = None,
+    ):
+        r"""Constrained auto-regressive generation for batched inputs.
+
+        Each sample uses an independent constraint state machine.
+
+        Args:
+            seqs: input sequences (audio latent, question ids, answering ids)
+            seq_types: type tag per seq ("audio" / "id")
+            max_new_ids: maximum tokens to generate
+            constraints: list of constraint objects, one per batch item
+            sep_token_id: tokenizer [SEP] token id
+            temperature: softmax temperature
+            top_k: top-k sampling width (applied after constraint masking)
+
+        Returns:
+            seqs: updated sequences with generated tokens appended to seqs[-1]
+        """
+        batch_size = seqs[-1].shape[0]
+        assert len(constraints) == batch_size
+
+        active = [True] * batch_size
+
+        for _t in range(max_new_ids):
+            outputs = self(seqs=seqs, seq_types=seq_types)
+            logits = outputs[-1][:, -1, :] / temperature  # shape: (b, v)
+
+            for b in range(batch_size):
+                if not active[b]:
+                    logits[b, :] = -float("Inf")
+                    logits[b, sep_token_id] = 0.0
+                    continue
+
+                if top_k is not None:
+                    _, raw_topk_ids = torch.topk(logits[b], min(top_k, logits.shape[-1]))
+                    constraints[b].count_violations(raw_topk_ids)
+
+                allowed_mask = constraints[b].get_allowed_mask()
+                logits[b, ~allowed_mask] = -float("Inf")
+
+                if top_k is not None:
+                    kth = torch.topk(logits[b], min(top_k, logits.shape[-1])).values[-1]
+                    logits[b, logits[b] < kth] = -float("Inf")
+
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)  # (b, 1)
+
+            seqs[-1] = torch.cat((seqs[-1], next_id), dim=1)
+
+            for b in range(batch_size):
+                if not active[b]:
+                    continue
+                should_continue = constraints[b].update(int(next_id[b, 0].item()))
+                if not should_continue:
+                    active[b] = False
+
+            if not any(active):
+                break
+
+        return seqs
+
 
 class Block(nn.Module):
     def __init__(self, config: LlamaConfig) -> None:
