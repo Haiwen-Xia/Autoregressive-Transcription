@@ -201,7 +201,7 @@ def batch_evaluate(
     include_program: bool = False,
     max_samples: Optional[int] = None,
     epochs: int = 1,
-    skip_empty_ref_for_averaging: bool = False,
+    skip_empty_ref_for_averaging: bool = True,
     verbose: bool = True,
 ) -> dict:
     r"""Run inference and evaluation over every sample in *dataset*.
@@ -260,22 +260,6 @@ def batch_evaluate(
                 print(f"[batch_evaluate] inference failed for sample {i}: {exc}")
             continue
 
-        notes = data.get("note", [])
-        is_empty_ref = len(notes) == 0
-        if is_empty_ref:
-            empty_ref_count += 1
-            est_notes = parse_tokens_to_notes(
-                tokens=tokens,
-                fps=fps,
-                include_program=include_program,
-                start_time=0.0,
-            )
-            if len(est_notes) == 0:
-                empty_pred_correct += 1
-
-            if skip_empty_ref_for_averaging:
-                continue
-
         result = _evaluate_cropped_item(
             data=data,
             output_tokens=tokens,
@@ -283,16 +267,29 @@ def batch_evaluate(
             include_program=include_program,
         )
 
+        diag = result.get("_diag", {})
+        ref_note_count = int(diag.get("ref_note_count", 0))
+        est_note_count = int(diag.get("est_note_count", 0))
+
+        # Empty-reference detection must follow cropped evaluation semantics.
+        # Using raw data["note"] can disagree with ref_notes(clipped) and
+        # silently pollute averaged F1 denominator.
+        if ref_note_count == 0:
+            empty_ref_count += 1
+            if est_note_count == 0:
+                empty_pred_correct += 1
+            if skip_empty_ref_for_averaging:
+                continue
+
         if verbose:
-            d = result.get("_diag", {})
             onset_f1 = result["note_onset"]["f1"]
             print(
                 f"[batch_eval] sample={i} | "
-                f"raw_notes={d.get('raw_note_count')} -> "
-                f"ref_notes(clipped)={d.get('ref_note_count')} | "
-                f"est_notes={d.get('est_note_count')} | "
-                f"est_tokens={d.get('est_token_count')} | "
-                f"start={d.get('start_time'):.2f} dur={d.get('duration'):.2f} | "
+                f"raw_notes={diag.get('raw_note_count')} -> "
+                f"ref_notes(clipped)={diag.get('ref_note_count')} | "
+                f"est_notes={diag.get('est_note_count')} | "
+                f"est_tokens={diag.get('est_token_count')} | "
+                f"start={diag.get('start_time'):.2f} dur={diag.get('duration'):.2f} | "
                 f"onset_f1={onset_f1:.4f}"
             )
 

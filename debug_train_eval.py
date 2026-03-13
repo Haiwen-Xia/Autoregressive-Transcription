@@ -494,7 +494,7 @@ def main_func(cfg: DictConfig) -> None:
         include_program=include_program,
         max_samples=len(fixed_dataset),
         epochs=1,
-        skip_empty_ref_for_averaging=(getattr(fixed_dataset, "mode", None) == "single"),
+        skip_empty_ref_for_averaging=True,
         verbose=True,
     )
     pre_eval_small = _keep_only_f1_metrics(pre_eval)
@@ -551,7 +551,7 @@ def main_func(cfg: DictConfig) -> None:
         include_program=include_program,
         max_samples=len(fixed_dataset),
         epochs=1,
-        skip_empty_ref_for_averaging=(getattr(fixed_dataset, "mode", None) == "single"),
+        skip_empty_ref_for_averaging=True,
         verbose=True,
     )
     post_eval_small = _keep_only_f1_metrics(post_eval)
