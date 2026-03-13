@@ -27,7 +27,7 @@ class Conformer2DConfig:
     sr: int = 16000
     n_fft: int = 2048
     hop_length: int = 160
-    block_size: int = 512 #* currently, 10s audio -> 1000 frames --> 250 frames after downsample, which can be handled by RoPE. If block_size is too small, the performance may drop.
+    block_size: int = 1024 #* currently, 10s audio -> 1000 frames --> 250 frames after downsample, which can be handled by RoPE. If block_size is too small, the performance may drop.
     enc_layers: int = 6
     dec_layers: int = 6
     n_head: int = 16

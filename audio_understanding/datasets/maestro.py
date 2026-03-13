@@ -224,6 +224,7 @@ class MAESTRO(Dataset):
         data: dict,
         output_tokens: list[str],
         fps: float,
+        include_program: bool = False,
     ) -> dict:
         r"""Evaluate model output tokens against ground truth for one sample.
 
@@ -255,17 +256,24 @@ class MAESTRO(Dataset):
         )
 
         start_time = data["start_time"]
+        duration = float(data["duration"])
+        assert not include_program, "MAESTRO does not support program-aware evaluation"
 
         # Build reference note list (times relative to clip start)
-        ref_notes = [
-            {
-                "onset_time":  note.start - start_time,
-                "offset_time": note.end   - start_time,
-                "pitch":       note.pitch,
-                "velocity":    note.velocity,
-            }
-            for note in data["note"]
-        ]
+        ref_notes = []
+        for note in data["note"]:
+            onset_time = max(0.0, float(note.start - start_time))
+            offset_time = min(duration, float(note.end - start_time))
+            if offset_time < onset_time:
+                continue
+            ref_notes.append(
+                {
+                    "onset_time": onset_time,
+                    "offset_time": offset_time,
+                    "pitch": note.pitch,
+                    "velocity": note.velocity,
+                }
+            )
 
         # Parse model output tokens into note dicts
         est_notes = parse_tokens_to_notes(
@@ -273,6 +281,7 @@ class MAESTRO(Dataset):
             fps=fps,
             include_program=False,
             start_time=0.0,
+            clip_duration=duration,
         )
 
         return {
