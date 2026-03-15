@@ -199,7 +199,7 @@ class Slakh2100(Dataset):
         midi_track_ids = self.get_available_midi_track_ids(midis_dir, meta)
         candidate_track_ids = sorted(set(audio_track_ids).intersection(midi_track_ids))
         assert len(candidate_track_ids) > 0
-
+        #* mode instilled here
         input_track_ids, target_track_ids = self.sample_input_and_target_track_ids(candidate_track_ids)
 
         if self.mode == "single":
@@ -464,7 +464,7 @@ class Slakh2100(Dataset):
 
         for track in data["tracks"]:
             
-            if not self.include_drum:
+            if not self.include_drum: #* dumping drum here
                 if track["is_drum"] or track["program_num"] == 128:
                     continue
             notes = clip_notes(track["note"], data["start_time"], data["duration"])
@@ -517,7 +517,7 @@ class Slakh2100(Dataset):
         duration: float,
         compress_to_one_track: bool = True
     ) -> dict:
-        use_mix_source = self.mode in ["all", "all2all"]
+        use_mix_source = self.mode in ["all", "all2all"] # meaning, the target midi is loaded from all_src.mid
 
         if use_mix_source:
             data = load_target_from_mix_midi(
@@ -563,10 +563,6 @@ class Slakh2100(Dataset):
         targets a single instrument (X2one setting such as ``all2one`` /
         ``single`` mode), program-aware F1 and per-instrument metrics are also
         returned.
-
-        **Modes without instrument prediction** (e.g. ``all``/``all2all``,
-        ``rand_mix``): pass ``include_program=False``.  Only onset and offset
-        F1 are returned.
 
         **Modes with instrument prediction** (``include_program=True``): the
         model output tokens contain ``program=X`` fields.  Program-aware F1

@@ -61,6 +61,7 @@ class MAESTRO(Dataset):
         transform: None | callable = Mono(),
         load_target: bool = True,
         extend_pedal: bool = True,
+        include_program: bool = False,
         target_transform: None | callable = PianoRoll(fps=100, pitches_num=128),
     ) -> None:
 
@@ -70,6 +71,7 @@ class MAESTRO(Dataset):
         self.crop = crop
         self.load_target = load_target
         self.extend_pedal = extend_pedal
+        self.include_program = include_program
         self.transform = transform
         self.target_transform = target_transform
 
@@ -212,6 +214,16 @@ class MAESTRO(Dataset):
             "duration": duration,
             "midi_path": midi_path
         }
+
+        if self.include_program:
+            note_num = len(notes)
+            target.update(
+                {
+                    "note_program": [0] * note_num,
+                    "note_is_drum": [False] * note_num,
+                    "note_inst_class": ["piano"] * note_num,
+                }
+            )
         
         # Transform target
         if self.target_transform:
@@ -257,34 +269,53 @@ class MAESTRO(Dataset):
 
         start_time = data["start_time"]
         duration = float(data["duration"])
-        assert not include_program, "MAESTRO does not support program-aware evaluation"
+        notes = data["note"]
+        note_programs = data.get("note_program", [])
+        note_is_drum = data.get("note_is_drum", [])
+        note_inst_class = data.get("note_inst_class", [])
+        has_inst_meta = (
+            len(note_programs) == len(notes)
+            and len(note_is_drum) == len(notes)
+            and len(notes) > 0
+        )
 
         # Build reference note list (times relative to clip start)
         ref_notes = []
-        for note in data["note"]:
+        for idx, note in enumerate(notes):
             onset_time = max(0.0, float(note.start - start_time))
             offset_time = min(duration, float(note.end - start_time))
             if offset_time < onset_time:
                 continue
-            ref_notes.append(
-                {
-                    "onset_time": onset_time,
-                    "offset_time": offset_time,
-                    "pitch": note.pitch,
-                    "velocity": note.velocity,
-                }
-            )
+            note_dict: dict = {
+                "onset_time": onset_time,
+                "offset_time": offset_time,
+                "pitch": note.pitch,
+                "velocity": note.velocity,
+            }
+            if has_inst_meta:
+                note_dict["program"] = int(note_programs[idx])
+                note_dict["is_drum"] = bool(note_is_drum[idx])
+                note_dict["inst_class"] = (
+                    note_inst_class[idx] if note_inst_class else "piano"
+                )
+            ref_notes.append(note_dict)
 
         # Parse model output tokens into note dicts
         est_notes = parse_tokens_to_notes(
             tokens=output_tokens,
             fps=fps,
-            include_program=False,
+            include_program=include_program,
             start_time=0.0,
             clip_duration=duration,
         )
 
-        return {
+        results = {
             "note_onset":  note_onset_f1(ref_notes, est_notes),
             "note_offset": note_with_offset_f1(ref_notes, est_notes),
         }
+
+        if include_program and has_inst_meta:
+            results["program_aware"] = program_aware_f1(ref_notes, est_notes)
+            results["per_instrument"] = per_instrument_metrics(ref_notes, est_notes)
+
+        return results

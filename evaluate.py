@@ -367,15 +367,31 @@ def evaluate_song(
 
 
 def _get_target_text(data: dict) -> str:
-    target = (
-        data.get("target")
-        or data.get("text")
-        or data.get("caption")
-        or data.get("label")
-        or ""
+    candidate_keys = [
+        "target",
+        "text",
+        "caption",
+        "label",
+        "answer",
+        "answering",
+        "response",
+        "genre",
+    ]
+
+    for key in candidate_keys:
+        if key not in data:
+            continue
+
+        value = data[key]
+        if isinstance(value, str) and value != "":
+            return value
+
+        if isinstance(value, (list, tuple)) and len(value) > 0 and all(isinstance(x, str) for x in value):
+            return " ".join(value)
+
+    raise AssertionError(
+        f"Cannot find text target in sample. Available keys: {list(data.keys())}"
     )
-    assert isinstance(target, str), f"Expected text target to be str, but got {type(target)}"
-    return target
 
 
 def _compute_teacher_forced_ce_and_logits(
@@ -858,6 +874,10 @@ def main_func(args: argparse.Namespace) -> None:
 
     # --- Evaluate ---
     if dataset_name in ("MAESTRO", "Slakh2100"):
+        transcription_max_samples = args.max_samples
+        if eval_mode == "song":
+            transcription_max_samples = max(1, args.max_samples // 4)
+
         if eval_mode == "segment":
             print("\n=== Segment-wise Evaluation (fast) ===")
             results, inference_details = evaluate_segment(
@@ -867,7 +887,7 @@ def main_func(args: argparse.Namespace) -> None:
                 tokenizer=tokenizer,
                 configs=configs,
                 device=device,
-                max_samples=args.max_samples,
+                max_samples=transcription_max_samples,
             )
         else:
             print("\n=== Song-wise Evaluation (full audio) ===")
@@ -878,16 +898,31 @@ def main_func(args: argparse.Namespace) -> None:
                 tokenizer=tokenizer,
                 configs=configs,
                 device=device,
-                max_samples=args.max_samples // 4,
+                max_samples=transcription_max_samples,
             )
 
         eval_metrics = results
         additional_info["inference_details"] = inference_details
 
+        include_program = bool(configs.get("midi_include_program", False))
+        ce_summary, ce_details = collect_transcription_teacher_forced_stats(
+            dataset=dataset,
+            audio_encoder=audio_encoder,
+            llm=llm,
+            tokenizer=tokenizer,
+            configs=configs,
+            device=device,
+            include_program=include_program,
+            max_samples=transcription_max_samples,
+        )
+        eval_metrics["teacher_forced_ce"] = ce_summary
+        additional_info["teacher_forced_details"] = ce_details
+
         print("\n=== Evaluation Results ===")
         print(json.dumps(results, indent=2, default=str))
+        print(f"Mean CE: {ce_summary['mean_ce']:.6f}")
 
-    elif dataset_name in ("LibriSpeech", "GTZAN", "Clotho", "AudioCaps", "WavCaps"):
+    else:
         text_results, ce_summary, ce_details = run_text_evaluation(
             dataset=dataset,
             dataset_name=dataset_name,
@@ -899,10 +934,7 @@ def main_func(args: argparse.Namespace) -> None:
             max_samples=args.max_samples,
         )
 
-        eval_metrics = {
-            "n_samples": len(text_results),
-            "teacher_forced_ce": ce_summary,
-        }
+        eval_metrics["teacher_forced_ce"] = ce_summary
         additional_info["text_results"] = text_results
         additional_info["teacher_forced_details"] = ce_details
 
@@ -910,8 +942,6 @@ def main_func(args: argparse.Namespace) -> None:
         print(f"Evaluated {len(text_results)} samples.")
         print(f"Mean CE: {ce_summary['mean_ce']:.6f}")
 
-    else:
-        raise ValueError(f"Unsupported dataset for evaluation: {dataset_name}")
 
     summary_record = {
         "evaluate_time": evaluate_time,
@@ -956,13 +986,13 @@ def main() -> None:
     parser.add_argument(
         "--max_samples",
         type=int,
-        default=4,
+        default=20,
         help="Cap the number of evaluation samples (useful for quick checks).",
     )
     parser.add_argument(
         "--eval_mode",
         type=str,
-        default="song",
+        default="segment",
         choices=["segment", "song"],
         help="segment: random clips, fast; song: full audio, chunked inference.",
     )

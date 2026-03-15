@@ -18,10 +18,10 @@ import torch.distributed as dist
 
 import wandb
 from audio_understanding.data.samplers import InfiniteSampler
+from audio_understanding.eval.transcription.batch_eval import batch_evaluate
 from audio_understanding.utils import remove_padded_columns
 from train import (
     ce_loss,
-    format_tokens_by_event,
     get_audio_encoder,
     get_audio_question_answering,
     get_dataset,
@@ -29,16 +29,16 @@ from train import (
     get_llm,
     get_optimizer_and_scheduler,
     get_tokenizer,
-    tokens_to_midi,
     transcribe_audio,
     validate,
+    _log_transcription_samples
 )
 
 
 def _build_processed_run_name(run_name: None | str) -> str:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     if run_name:
-        return f"{run_name}_{timestamp}"
+        return f"{timestamp}_{run_name}"
     return timestamp
 
 
@@ -54,6 +54,8 @@ def _setup_output_and_logger(
     output_root = Path(output_root_value)
     if not output_root.is_absolute():
         output_root = (root_dir / output_root).resolve()
+    if configs.get("no_log", False):
+        output_root = root_dir / "no_log"
 
     output_dir = output_root / processed_run_name
     ckpt_dir = output_dir / "ckpt"
@@ -105,89 +107,6 @@ def _cleanup_runtime(accelerator: Accelerator | None) -> None:
         torch.cuda.empty_cache()
 
 
-def _log_transcription_samples(
-    configs: dict,
-    dataset,
-    audio_encoder,
-    tokenizer,
-    llm,
-    output_dir: Path,
-    step: int,
-    logger: logging.Logger,
-    device,
-    n_samples: int = 2,
-) -> None:
-    """Pick n_samples from dataset, run constrained decoding, and log results."""
-    import soundfile as sf
-
-    include_program = configs.get("midi_include_program", False)
-    write_program_tracks = bool(configs.get("midi_write_program_tracks", include_program))
-    sr = configs["sample_rate"]
-    outputs_dir = output_dir / "outputs" / f"step={step}"
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-
-    skip_n = max(1, len(dataset) // n_samples)
-    sample_indices = list(range(0, len(dataset), skip_n))[:n_samples]
-
-    for idx in sample_indices:
-        data = dataset[idx]
-        audio_path = data.get("audio_path", "unknown")
-        midi_path = data.get("midi_path", "unknown")
-        question = data.get("question", "Music transcription.")
-        gt_tokens = data.get("token", [])
-
-        logger.info("=== Transcription sample idx=%d step=%d ===", idx, step)
-        logger.info("  audio_path: %s", audio_path)
-        logger.info("  midi_path:  %s", midi_path)
-        logger.info("  question:   %s", question)
-        logger.info("  GT tokens (%d):", len(gt_tokens))
-        format_str = format_tokens_by_event(gt_tokens, include_program=include_program)
-        logger.info("  GT notes: %d", len(format_str.splitlines()))
-        sample = "\n".join(format_str.splitlines()[:10])
-        logger.info("Sample GT tokens:\n%s\n...", sample)
-
-        audio = data["audio"]
-        if not isinstance(audio, torch.Tensor):
-            audio = torch.Tensor(audio)
-        audio_tensor = audio.unsqueeze(0).to(device)
-
-        clip_path = outputs_dir / f"sample_{idx}.wav"
-        audio_np = audio.squeeze().cpu().numpy()
-        sf.write(str(clip_path), audio_np, sr)
-
-        gt_midi_path = str(outputs_dir / f"sample_{idx}_gt.mid")
-        if gt_tokens:
-            tokens_to_midi(
-                tokens=gt_tokens,
-                fps=configs["fps"],
-                output_path=gt_midi_path,
-                include_program=include_program,
-                write_program_tracks=write_program_tracks,
-            )
-
-        midi_out_path = str(outputs_dir / f"sample_{idx}.mid")
-        result = transcribe_audio(
-            audio_encoder=audio_encoder,
-            llm=llm,
-            tokenizer=tokenizer,
-            audio_tensor=audio_tensor,
-            configs=configs,
-            output_midi_path=midi_out_path,
-            question=question,
-            temperature=1.0,
-            top_k=1,
-        )
-
-        logger.info("  Output tokens (%d):", len(result["tokens"]))
-        result_format_str = format_tokens_by_event(result["tokens"], include_program=include_program)
-        logger.info("  Output notes: %d", len(result_format_str.splitlines()))
-        sample = "\n".join(result_format_str.splitlines()[:10])
-        logger.info("Sample output tokens:\n%s\n...", sample)
-        logger.info("  Violations: %d/%d", result["violations"], result["total_topk"])
-        logger.info("  Saved audio clip: %s", clip_path)
-        logger.info("  Saved GT MIDI: %s", gt_midi_path)
-        logger.info("  Saved output MIDI: %s", midi_out_path)
-
 #* 目前还不具备
 def main_func(cfg: DictConfig) -> None:
     script_name = Path(__file__).stem
@@ -195,7 +114,12 @@ def main_func(cfg: DictConfig) -> None:
     configs = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
     assert isinstance(configs, dict)
 
-    kwargs = DDPK(find_unused_parameters=True)
+    ddp_find_unused_parameters = (
+        bool(configs["train"]["find_unused_parameters"])
+        if "find_unused_parameters" in configs["train"]
+        else True
+    )
+    kwargs = DDPK(find_unused_parameters=ddp_find_unused_parameters)
     accelerator = Accelerator(kwargs_handlers=[kwargs])
     accelerator_for_cleanup: Accelerator | None = accelerator
 
@@ -227,7 +151,8 @@ def main_func(cfg: DictConfig) -> None:
         if wandb_log and accelerator.is_main_process:
             wandb.init(
                 project="audio_understanding",
-                name=str(output_dir.parent.name + "/" + output_dir.name),
+                group=output_dir.parent.name,
+                name=str(output_dir.name),
                 config=cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True)),
             )
             wandb.save(str(cfg_save_path))
@@ -283,6 +208,7 @@ def main_func(cfg: DictConfig) -> None:
                 llm_total // 1024**2,
                 llm_trainable // 1024**2,
             )
+            logger.info("DDP find_unused_parameters: %s", ddp_find_unused_parameters)
             logger.info("Output dir: %s", output_dir)
             logger.info("Log file: %s", log_path)
 
@@ -296,8 +222,15 @@ def main_func(cfg: DictConfig) -> None:
             train_dataloader,
         )
 
-        for step, data in enumerate(tqdm(train_dataloader, disable=not accelerator.is_main_process)):
+        gradient_accumulation = configs["train"]["gradient_accumulation"] if "gradient_accumulation" in configs["train"] else 1
+        assert gradient_accumulation > 0
+        grad_clip_norm = float(configs["train"]["grad_clip_norm"]) if "grad_clip_norm" in configs["train"] else None
+        global_step = 0
+        optimizer.zero_grad()
+
+        for micro_step, data in enumerate(tqdm(train_dataloader, disable=not accelerator.is_main_process)):
             audio, question, answering = get_audio_question_answering(data)
+            audio = audio.to(accelerator.device)
 
             encoder_model = _unwrap(audio_encoder, accelerator)
             audio_latent = cast(Any, encoder_model).encode(audio=audio, train_mode=configs["audio_encoder"]["trainable"])
@@ -340,19 +273,43 @@ def main_func(cfg: DictConfig) -> None:
                 ignore_index=cast(Any, tokenizer).pad_token_id,
             )
 
-            optimizer.zero_grad()
-            accelerator.backward(loss)
+            accelerator.backward(loss / gradient_accumulation)
+
+            if (micro_step + 1) % gradient_accumulation != 0:
+                continue
+
+            grad_norm_value = None
+            if grad_clip_norm is not None:
+                params_to_clip = [
+                    p
+                    for p in list(audio_encoder.parameters()) + list(llm.parameters())
+                    if p.requires_grad
+                ]
+                grad_norm = accelerator.clip_grad_norm_(params_to_clip, grad_clip_norm)
+                if isinstance(grad_norm, torch.Tensor):
+                    grad_norm_value = float(grad_norm.item())
+                else:
+                    grad_norm_value = float(grad_norm)
+
             optimizer.step()
+            optimizer.zero_grad()
+            global_step += 1
 
             if scheduler:
                 scheduler.step()
 
-            if step % 100 == 0 and accelerator.is_main_process:
-                logger.info("Step: %d, Loss: %.6f", step, loss.item())
+            if global_step % 100 == 0 and accelerator.is_main_process:
+                if grad_norm_value is None:
+                    logger.info("Step: %d, Loss: %.6f", global_step, loss.item())
+                else:
+                    logger.info("Step: %d, Loss: %.6f, GradNorm: %.6f", global_step, loss.item(), grad_norm_value)
                 if wandb_log:
-                    wandb.log(data={"train_loss_step": loss.item()}, step=step)
+                    payload = {"train_loss_step": loss.item()}
+                    if grad_norm_value is not None:
+                        payload["grad_norm"] = grad_norm_value
+                    wandb.log(data=payload, step=global_step)
 
-            if step > 0 and step % configs["train"]["test_every_n_steps"] == 0 and accelerator.is_main_process:
+            if global_step % configs["train"]["test_every_n_steps"] == 500 and accelerator.is_main_process:
                 train_loss = validate(
                     configs=configs,
                     dataset=train_dataset,
@@ -372,14 +329,14 @@ def main_func(cfg: DictConfig) -> None:
                 if wandb_log:
                     wandb.log(
                         data={"train_loss": train_loss, "test_loss": test_loss},
-                        step=step,
+                        step=global_step,
                     )
 
                 logger.info("Train loss: %.6f", train_loss)
                 logger.info("Test loss: %.6f", test_loss)
 
-            if step > 0 and step % configs["train"]["save_every_n_steps"] == 0 and accelerator.is_main_process:
-                ckpt_path = ckpt_dir / f"step={step}.pth"
+            if global_step > 0 and global_step % configs["train"]["save_every_n_steps"] == 0 and accelerator.is_main_process:
+                ckpt_path = ckpt_dir / f"step={global_step}.pth"
                 ckpt = {}
 
                 if configs["audio_encoder"]["trainable"]:
@@ -391,21 +348,50 @@ def main_func(cfg: DictConfig) -> None:
                 torch.save(ckpt, ckpt_path)
                 logger.info("Save model to %s", ckpt_path)
 
-            if step * 10 % configs["train"]["save_every_n_steps"] == 0 and accelerator.is_main_process:
+
+            # if global_step == 10:
+            #     accelerator.wait_for_everyone()
+            #     import sys
+            #     sys.exit()          
+            if global_step * 10 % configs["train"]["save_every_n_steps"] == 0 and accelerator.is_main_process:
+                
+                train_log_n_samples = int(configs["train"].get("transcription_train_n_samples", 1))
+                test_log_n_samples = int(configs["train"].get("transcription_test_n_samples", 2))
+                logger.info("Logging train data samples:")
                 _log_transcription_samples(
+                    configs=configs,
+                    dataset=train_dataset,
+                    audio_encoder=_unwrap(audio_encoder, accelerator),
+                    tokenizer=tokenizer,
+                    llm=_unwrap(llm, accelerator),
+                    output_dir=output_dir,
+                    step=global_step,
+                    logger=logger,
+                    device=audio_latent.device,
+                    n_samples=train_log_n_samples,
+                    split_name="train",
+                    run_batch_eval=False,
+                )
+
+                logger.info("Logging test data samples and metrics:")
+                test_metrics = _log_transcription_samples(
                     configs=configs,
                     dataset=test_dataset,
                     audio_encoder=_unwrap(audio_encoder, accelerator),
                     tokenizer=tokenizer,
                     llm=_unwrap(llm, accelerator),
                     output_dir=output_dir,
-                    step=step,
+                    step=global_step,
                     logger=logger,
                     device=audio_latent.device,
-                    n_samples=2,
+                    n_samples=test_log_n_samples,
+                    split_name="test",
+                    run_batch_eval=True,
                 )
+                if wandb_log:
+                    wandb.log(data=test_metrics, step=global_step)
 
-            if step == configs["train"]["training_steps"]:
+            if global_step == configs["train"]["training_steps"]:
                 break
 
     except Exception as e:

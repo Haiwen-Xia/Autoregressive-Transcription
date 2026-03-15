@@ -19,8 +19,10 @@ from tqdm import tqdm
 
 import wandb
 from audio_understanding.data.samplers import InfiniteSampler
+from audio_understanding.eval.transcription.batch_eval import batch_evaluate
 from audio_understanding.utils import LinearWarmUp, remove_padded_columns
 from inference_transcription import transcribe_audio, format_tokens_by_event, tokens_to_midi
+import soundfile as sf
 
 
 def _setup_output_and_logger(configs: dict, script_name: str) -> tuple[Path, Path, Path, logging.Logger]:
@@ -151,6 +153,7 @@ def main_func(cfg: DictConfig) -> None:
     
     gradient_accumulation = configs["train"]["gradient_accumulation"] if "gradient_accumulation" in configs["train"] else 1
     assert gradient_accumulation > 0
+    grad_clip_norm = float(configs["train"]["grad_clip_norm"]) if "grad_clip_norm" in configs["train"] else None
     global_step = 0
     optimizer.zero_grad()
 
@@ -214,6 +217,16 @@ def main_func(cfg: DictConfig) -> None:
         if (micro_step + 1) % gradient_accumulation != 0:
             continue
 
+        grad_norm_value = None
+        if grad_clip_norm is not None:
+            params_to_clip = [
+                p
+                for p in list(audio_encoder.parameters()) + list(llm.parameters())
+                if p.requires_grad
+            ]
+            grad_norm = torch.nn.utils.clip_grad_norm_(params_to_clip, grad_clip_norm)
+            grad_norm_value = float(grad_norm.item())
+
         optimizer.step()
         optimizer.zero_grad()
         global_step += 1
@@ -222,9 +235,15 @@ def main_func(cfg: DictConfig) -> None:
             scheduler.step()
 
         if global_step % 100 == 0:
-            logger.info("Step: %d, Loss: %.6f", global_step, loss.item())
+            if grad_norm_value is None:
+                logger.info("Step: %d, Loss: %.6f", global_step, loss.item())
+            else:
+                logger.info("Step: %d, Loss: %.6f, GradNorm: %.6f", global_step, loss.item(), grad_norm_value)
             if wandb_log:
-                wandb.log(data={"train_loss_step": loss.item()}, step=global_step)
+                payload = {"train_loss_step": loss.item()}
+                if grad_norm_value is not None:
+                    payload["grad_norm"] = grad_norm_value
+                wandb.log(data=payload, step=global_step)
 
         if global_step % configs["train"]["test_every_n_steps"] == 500:
             train_loss = validate(
@@ -267,7 +286,27 @@ def main_func(cfg: DictConfig) -> None:
 
         # ------ Transcription sample logging (at save steps) ------
         if global_step * 10 % configs["train"]["save_every_n_steps"] == 0:
+            train_log_n_samples = int(configs["train"].get("transcription_train_n_samples", 1))
+            test_log_n_samples = int(configs["train"].get("transcription_test_n_samples", 2))
+
+            logger.info("Logging train data samples:")
             _log_transcription_samples(
+                configs=configs,
+                dataset=train_dataset,
+                audio_encoder=audio_encoder,
+                tokenizer=tokenizer,
+                llm=llm,
+                output_dir=output_dir,
+                step=global_step,
+                logger=logger,
+                device=device,
+                n_samples=train_log_n_samples,
+                split_name="train",
+                run_batch_eval=False,
+            )
+            
+            logger.info("Logging test data samples and metrics:")
+            test_metrics = _log_transcription_samples(
                 configs=configs,
                 dataset=test_dataset,
                 audio_encoder=audio_encoder,
@@ -277,8 +316,12 @@ def main_func(cfg: DictConfig) -> None:
                 step=global_step,
                 logger=logger,
                 device=device,
-                n_samples=2,
+                n_samples=test_log_n_samples,
+                split_name="test",
+                run_batch_eval=True,
             )
+            if wandb_log:
+                wandb.log(data=test_metrics, step=global_step)
 
         if global_step == configs["train"]["training_steps"]:
             break
@@ -295,14 +338,17 @@ def _log_transcription_samples(
     logger: logging.Logger,
     device: str,
     n_samples: int = 2,
-) -> None:
+    split_name: str = "test",
+    run_batch_eval: bool = True,
+) -> dict[str, float]:
     """Pick n_samples from dataset, run constrained decoding, log results."""
-    import soundfile as sf
+    
+    # import soundfile as sf
 
     include_program = configs.get("midi_include_program", False)
     write_program_tracks = bool(configs.get("midi_write_program_tracks", include_program))
     sr = configs["sample_rate"]
-    outputs_dir = output_dir / "outputs" / f"step={step}"
+    outputs_dir = output_dir / "outputs" / f"step={step}" / split_name
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
     skip_n = max(1, len(dataset) // n_samples)
@@ -311,13 +357,25 @@ def _log_transcription_samples(
     for idx in sample_indices:
         data = dataset[idx]
         audio_path = data.get("audio_path", "unknown")
+        audio_paths = data.get("audio_paths", [])
         midi_path = data.get("midi_path", "unknown")
+        midi_paths = data.get("midi_paths", [])
+        input_track_ids = data.get("input_track_ids", [])
+        target_track_ids = data.get("target_track_ids", [])
         question = data.get("question", "Music transcription.")
         gt_tokens = data.get("token", [])
 
-        logger.info("=== Transcription sample idx=%d step=%d ===", idx, step)
+        logger.info("=== Transcription sample split=%s idx=%d step=%d ===", split_name, idx, step)
         logger.info("  audio_path: %s", audio_path)
+        if len(audio_paths) > 0:
+            logger.info("  audio_paths (%d): %s", len(audio_paths), audio_paths)
         logger.info("  midi_path:  %s", midi_path)
+        if len(midi_paths) > 0:
+            logger.info("  midi_paths (%d): %s", len(midi_paths), midi_paths)
+        if len(input_track_ids) > 0:
+            logger.info("  input_track_ids (%d): %s", len(input_track_ids), input_track_ids)
+        if len(target_track_ids) > 0:
+            logger.info("  target_track_ids (%d): %s", len(target_track_ids), target_track_ids)
         logger.info("  question:   %s", question)
         logger.info("  GT tokens (%d):", len(gt_tokens))
         format_str = format_tokens_by_event(gt_tokens, include_program=include_program)
@@ -369,6 +427,62 @@ def _log_transcription_samples(
         logger.info("  Saved GT MIDI: %s", gt_midi_path)
         logger.info("  Saved output MIDI: %s", midi_out_path)
 
+    def inference_fn(item: dict) -> list[str]:
+        audio = item["audio"]
+        if not isinstance(audio, torch.Tensor):
+            audio = torch.as_tensor(audio)
+        audio_tensor = audio.unsqueeze(0).to(device)
+        question = item.get("question", "Music transcription.")
+        result = transcribe_audio(
+            audio_encoder=audio_encoder,
+            llm=llm,
+            tokenizer=tokenizer,
+            audio_tensor=audio_tensor,
+            configs=configs,
+            question=question,
+            temperature=1.0,
+            top_k=1,
+        )
+        return cast(list[str], result["tokens"])
+
+    if not run_batch_eval:
+        logger.info("Skip BatchEval for split=%s at step=%d", split_name, step)
+        return {}
+
+    eval_max_samples = None
+    if "transcription_eval_max_samples" in configs["train"]:
+        eval_max_samples = int(configs["train"]["transcription_eval_max_samples"])
+
+    summary = batch_evaluate(
+        dataset=dataset,
+        inference_fn=inference_fn,
+        fps=float(configs["fps"]),
+        include_program=include_program,
+        max_samples=eval_max_samples,
+        verbose=False,
+    )
+
+    onset_f1 = float(summary["note_onset"]["f1"])
+    offset_f1 = float(summary["note_offset"]["f1"])
+    program_f1 = 0.0
+    if "program_aware" in summary:
+        program_f1 = float(summary["program_aware"]["f1"])
+
+    logger.info(
+        "BatchEval split=%s step=%d | onset_f1=%.6f | offset_f1=%.6f | program_f1=%.6f",
+        split_name,
+        step,
+        onset_f1,
+        offset_f1,
+        program_f1,
+    )
+
+    return {
+        "batch_eval/onset_f1": onset_f1,
+        "batch_eval/offset_f1": offset_f1,
+        "batch_eval/program_f1": program_f1,
+    }
+
 
 def get_dataset(
     configs: dict, 
@@ -383,6 +497,7 @@ def get_dataset(
     sr = configs["sample_rate"]
     clip_duration = configs["clip_duration"]
     include_program = configs["midi_include_program"] if "midi_include_program" in configs else False
+    include_drum = configs["include_drum"] if "include_drum" in configs else True
     datasets_split = f"{split}_datasets"
 
     datasets = []
@@ -442,6 +557,7 @@ def get_dataset(
                 transform=Mono(),
                 load_target=True,
                 extend_pedal=True,
+                include_program=include_program,
                 target_transform=midi_transform,
             )
             datasets.append(dataset)
@@ -472,6 +588,7 @@ def get_dataset(
                 target_transform=midi_transform,
                 sample_num=sample_num,
                 mode=mode,
+                include_drum=include_drum,
                 keep_track_info=keep_track_info,
                 question_config=question_config,
             )
@@ -540,7 +657,7 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
         model = Conformer2D(sr=sr, trainable=trainable, use_decoder=use_decoder)
         
     elif name == "Conformer2D_nopool":
-        from audio_understanding.audio_encoders.conformer2d_nopool import Conformer2D
+        from audio_understanding.audio_encoders.conformer2d_nopool import Conformer2D #* slakh and maestro only differ between heads, don't matter that much
         model = Conformer2D(sr=sr, trainable=trainable, use_decoder=use_decoder)
 
     elif name == "MERT":
@@ -637,6 +754,24 @@ def get_llm(configs: dict, audio_latent_dim: int, vocab_size: int, ckpt_path: st
             n_embd=n_embd,
         )
         model = Llama(config=config)
+
+    elif name == "T5":
+        from audio_understanding.llm.t5 import T5, T5Config
+
+        block_size = configs["llm"]["block_size"]
+        n_layer = configs["llm"]["n_layer"]
+        n_head = configs["llm"]["n_head"]
+        n_embd = configs["llm"]["n_embd"]
+
+        config = T5Config(
+            block_size=block_size,
+            audio_latent_dim=audio_latent_dim,
+            vocab_size=vocab_size,
+            n_layer=n_layer,
+            n_head=n_head,
+            n_embd=n_embd,
+        )
+        model = T5(config=config)
 
     else:
         raise ValueError(name)

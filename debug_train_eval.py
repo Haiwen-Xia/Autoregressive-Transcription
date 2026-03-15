@@ -504,7 +504,7 @@ def main_func(cfg: DictConfig) -> None:
     assert batch_size > 0
     gradient_accumulation = int(configs["train"].get("gradient_accumulation", 1))
     assert gradient_accumulation > 0
-    train_steps = int(configs.get("debug", {}).get("train_steps", 3000))
+    train_steps = int(configs.get("debug", {}).get("train_steps", 1000))
     assert train_steps > 0
 
     optimizer.zero_grad()

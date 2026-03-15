@@ -47,6 +47,8 @@ def build_launch_command(
         gpu_ids,
         "--num_processes",
         str(nproc),
+        # "--main_process_port",
+        # "0",
         str(train_accelerate_script),
         *passthrough,
     ]
