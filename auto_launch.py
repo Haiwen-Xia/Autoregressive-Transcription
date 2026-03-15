@@ -81,7 +81,12 @@ def main_func(args: argparse.Namespace) -> int:
         print(f"[auto_launch] Multi-GPU launch: CUDA_VISIBLE_DEVICES={gpu_ids}, num_processes={nproc}")
     print("  " + shlex.join(cmd))
 
-    return subprocess.call(cmd, env=env)
+    proc = subprocess.Popen(cmd, env=env)
+    if nproc <= 1:
+        print(f"[auto_launch] train PID: {proc.pid}")
+    else:
+        print(f"[auto_launch] accelerate PID: {proc.pid}")
+    return proc.wait()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

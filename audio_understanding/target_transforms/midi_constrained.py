@@ -48,9 +48,12 @@ class MidiConstrainedDecoder:
         time_start = tok.convert_tokens_to_ids("time_index=0")
         self.masks[self.EXPECT_TIME, time_start : time_start + 6001] = True
 
-        # EXPECT_PITCH: pitch=0..127
+        # EXPECT_PITCH: pitch=0..127 plus optional drum_pitch=0..127
         pitch_start = tok.convert_tokens_to_ids("pitch=0")
         self.masks[self.EXPECT_PITCH, pitch_start : pitch_start + 128] = True
+        drum_pitch_start = tok.convert_tokens_to_ids("drum_pitch=0")
+        if drum_pitch_start != tok.unk_token_id:
+            self.masks[self.EXPECT_PITCH, drum_pitch_start : drum_pitch_start + 128] = True
 
         # EXPECT_VELOCITY: velocity=0..127
         vel_start = tok.convert_tokens_to_ids("velocity=0")

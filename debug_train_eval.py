@@ -278,6 +278,7 @@ def _dump_target_and_output_midis(
     logger: logging.Logger,
 ) -> None:
     include_program = bool(configs.get("midi_include_program", False))
+    drum_pitch = bool(configs.get("tokenizer", {}).get("drum_pitch", False))
     write_program_tracks = bool(configs.get("midi_write_program_tracks", include_program))
     stage_dir = output_dir / "midi_dump" / stage_name
     stage_dir.mkdir(parents=True, exist_ok=True)
@@ -287,17 +288,19 @@ def _dump_target_and_output_midis(
 
     n_dump = min(max_dump_samples, len(fixed_items))
     logger.info(
-        "Dump MIDI pairs (%s): n_samples=%d, dataset=%s, include_program=%s",
+        "Dump MIDI pairs (%s): n_samples=%d, dataset=%s, include_program=%s, drum_pitch=%s",
         stage_name,
         n_dump,
         dataset_name,
         include_program,
+        drum_pitch,
     )
 
     for i in range(n_dump):
         data = fixed_items[i]
 
         target_tokens = data["token"]
+        target_drum_pitch_num = sum(1 for t in target_tokens if isinstance(t, str) and t.startswith("drum_pitch="))
         target_midi_path = stage_dir / f"sample_{i:02d}_target.mid"
         tokens_to_midi(
             tokens=target_tokens,
@@ -366,11 +369,12 @@ def _dump_target_and_output_midis(
             json.dump(metadata, fw, indent=2, ensure_ascii=False)
 
         logger.info(
-            "MIDI+metrics saved (%s, sample=%d): target=%s output=%s metrics=%s metadata=%s",
+            "MIDI+metrics saved (%s, sample=%d): target=%s output=%s drum_pitch_tokens=%d metrics=%s metadata=%s",
             stage_name,
             i,
             target_midi_path,
             output_midi_path,
+            target_drum_pitch_num,
             json.dumps(sample_metric["metrics"], ensure_ascii=False),
             metadata_path,
         )
@@ -416,7 +420,13 @@ def main_func(cfg: DictConfig) -> None:
 
 
     include_program = bool(configs.get("midi_include_program", False))
-    logger.info("Eval setup: dataset=%s include_program=%s", dataset_name, include_program)
+    drum_pitch = bool(configs.get("tokenizer", {}).get("drum_pitch", False))
+    logger.info(
+        "Eval setup: dataset=%s include_program=%s drum_pitch=%s",
+        dataset_name,
+        include_program,
+        drum_pitch,
+    )
 
 
 

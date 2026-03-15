@@ -480,16 +480,26 @@ def _compute_teacher_forced_ce_and_logits(
     }
 
 
-def _build_transcription_target_tokens(data: dict, fps: float, include_program: bool) -> list[str]:
+def _build_transcription_target_tokens(
+    data: dict,
+    fps: float,
+    include_program: bool,
+    drum_pitch: bool,
+) -> list[str]:
     from audio_understanding.target_transforms.midi import MIDI2Tokens
 
-    midi_to_tokens = MIDI2Tokens(fps=fps, include_program=include_program)
+    midi_to_tokens = MIDI2Tokens(
+        fps=fps,
+        include_program=include_program,
+        drum_pitch=drum_pitch,
+    )
     target_data = {
         "start_time": data["start_time"],
         "duration": data["duration"],
         "note": data.get("note", []),
         "pedal": data.get("pedal", []),
         "note_program": data.get("note_program"),
+        "note_is_drum": data.get("note_is_drum"),
     }
     token_data = midi_to_tokens(copy.deepcopy(target_data))
     tokens = token_data.get("token", [])
@@ -529,6 +539,8 @@ def _collect_transcription_sample_previews(
     sample_indices = list(range(0, n_total, step))[:n_samples]
 
     previews = []
+    drum_pitch = bool(configs.get("tokenizer", {}).get("drum_pitch", False))
+
     for idx in sample_indices:
         data = dataset[idx]
         audio = data["audio"]
@@ -541,6 +553,7 @@ def _collect_transcription_sample_previews(
             data=data,
             fps=configs["fps"],
             include_program=include_program,
+            drum_pitch=drum_pitch,
         )
 
         result = transcribe_audio(
@@ -643,12 +656,15 @@ def collect_transcription_teacher_forced_stats(
     except ImportError:
         iterator = range(n_total)
 
+    drum_pitch = bool(configs.get("tokenizer", {}).get("drum_pitch", False))
+
     for i in iterator:
         data = dataset[i]
         target_tokens = _build_transcription_target_tokens(
             data=data,
             fps=configs["fps"],
             include_program=include_program,
+            drum_pitch=drum_pitch,
         )
         ce_info = _compute_teacher_forced_ce_and_logits(
             data=data,

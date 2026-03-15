@@ -498,6 +498,8 @@ def get_dataset(
     clip_duration = configs["clip_duration"]
     include_program = configs["midi_include_program"] if "midi_include_program" in configs else False
     include_drum = configs["include_drum"] if "include_drum" in configs else True
+    tokenizer_cfg = configs["tokenizer"] if "tokenizer" in configs else {}
+    drum_pitch = bool(tokenizer_cfg.get("drum_pitch", False))
     datasets_split = f"{split}_datasets"
 
     datasets = []
@@ -545,7 +547,11 @@ def get_dataset(
             from audio_understanding.target_transforms.midi import MIDI2Tokens
 
             if configs["midi_to_tokens"] == "MIDI2Tokens":
-                midi_transform = MIDI2Tokens(fps=configs["fps"], include_program=include_program)
+                midi_transform = MIDI2Tokens(
+                    fps=configs["fps"],
+                    include_program=include_program,
+                    drum_pitch=drum_pitch,
+                )
             else:
                 raise NotImplementedError
 
@@ -567,7 +573,11 @@ def get_dataset(
             from audio_understanding.target_transforms.midi import MIDI2Tokens
 
             if configs["midi_to_tokens"] == "MIDI2Tokens":
-                midi_transform = MIDI2Tokens(fps=configs["fps"], include_program=include_program)
+                midi_transform = MIDI2Tokens(
+                    fps=configs["fps"],
+                    include_program=include_program,
+                    drum_pitch=drum_pitch,
+                )
             else:
                 raise NotImplementedError
 
@@ -712,6 +722,7 @@ def get_tokenizer(configs: dict) -> Any:
     r"""Get tokenizer."""
 
     name = configs["tokenizer"]["name"]
+    drum_pitch = bool(configs["tokenizer"].get("drum_pitch", False))
 
     if name == "Bert":
         from audio_understanding.tokenizers.bert import Bert
@@ -721,7 +732,7 @@ def get_tokenizer(configs: dict) -> Any:
     elif name == "BertMIDI":
         from audio_understanding.tokenizers.bert_midi import BertMIDI
 
-        tokenizer = BertMIDI()
+        tokenizer = BertMIDI(drum_pitch=drum_pitch)
 
     else:
         raise ValueError(name)

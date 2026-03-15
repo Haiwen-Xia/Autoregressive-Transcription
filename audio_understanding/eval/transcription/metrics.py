@@ -59,9 +59,9 @@ def parse_tokens_to_notes(
 
     Token order per event (matching MIDI2Tokens construction order):
 
-    * note_onset:  ``name=note_onset``, ``time_index=X``, ``pitch=X``,
+        * note_onset:  ``name=note_onset``, ``time_index=X``, ``pitch=X`` or ``drum_pitch=X``,
       ``velocity=X`` [, ``program=X``]
-    * note_offset: ``name=note_offset``, ``time_index=X``, ``pitch=X``
+        * note_offset: ``name=note_offset``, ``time_index=X``, ``pitch=X`` or ``drum_pitch=X``
       [, ``program=X``]
 
     Args:
@@ -105,7 +105,9 @@ def parse_tokens_to_notes(
                 break
             try:
                 time_index = int(tokens[i + 1].split("=")[1])
-                pitch = int(tokens[i + 2].split("=")[1])
+                pitch_key, pitch_value = tokens[i + 2].split("=", 1)
+                assert pitch_key in ["pitch", "drum_pitch"]
+                pitch = int(pitch_value)
                 velocity = int(tokens[i + 3].split("=")[1])
             except (ValueError, IndexError):
                 i += 1
@@ -121,6 +123,9 @@ def parse_tokens_to_notes(
                     note["program"] = int(tokens[i + 4].split("=")[1])
                 except (ValueError, IndexError):
                     note["program"] = 0
+            elif pitch_key == "drum_pitch":
+                note["program"] = DRUM_PROGRAM
+                note["is_drum"] = True
             open_key: object = pitch
             if include_program:
                 open_key = (pitch, int(note["program"]))
@@ -134,7 +139,9 @@ def parse_tokens_to_notes(
                 break
             try:
                 time_index = int(tokens[i + 1].split("=")[1])
-                pitch = int(tokens[i + 2].split("=")[1])
+                pitch_key, pitch_value = tokens[i + 2].split("=", 1)
+                assert pitch_key in ["pitch", "drum_pitch"]
+                pitch = int(pitch_value)
             except (ValueError, IndexError):
                 i += 1
                 continue
@@ -145,6 +152,8 @@ def parse_tokens_to_notes(
                 except (ValueError, IndexError):
                     close_program = 0
                 close_key = (pitch, close_program)
+            elif pitch_key == "drum_pitch":
+                close_key = (pitch, DRUM_PROGRAM)
 
             if open_notes.get(close_key):
                 # Match offset to the earliest unmatched same-pitch onset (queue/FIFO).
@@ -175,6 +184,9 @@ def parse_tokens_to_notes(
                     }
                     if include_program:
                         note["program"] = int(close_program)
+                    elif pitch_key == "drum_pitch":
+                        note["program"] = DRUM_PROGRAM
+                        note["is_drum"] = True
                     finished.append(note)
             i += event_len
             continue

@@ -175,8 +175,8 @@ def tokens_to_midi(
     """Convert generated token list to a MIDI file.
 
     Expected token order per event (MIDI2Tokens construction order):
-        note_onset:  name=note_onset, time_index=X, pitch=X, velocity=X [, program=X]
-        note_offset: name=note_offset, time_index=X, pitch=X [, program=X]
+        note_onset:  name=note_onset, time_index=X, (pitch|drum_pitch)=X, velocity=X [, program=X]
+        note_offset: name=note_offset, time_index=X, (pitch|drum_pitch)=X [, program=X]
     """
     note_dict: dict[tuple[int, int], list[dict]] = {}
     n = len(tokens)
@@ -196,11 +196,14 @@ def tokens_to_midi(
             if i + event_len > n:
                 break
             time_index = int(tokens[i + 1].split("=")[1])
-            pitch = int(tokens[i + 2].split("=")[1])
+            pitch_key, pitch_value = tokens[i + 2].split("=", 1)
+            pitch = int(pitch_value)
             velocity = int(tokens[i + 3].split("=")[1])
             program = 0
             if include_program:
                 program = int(tokens[i + 4].split("=")[1])
+            elif pitch_key == "drum_pitch":
+                program = 128
             note = {
                 "onset_time_index": time_index,
                 "pitch": pitch,
@@ -220,10 +223,13 @@ def tokens_to_midi(
             if i + event_len > n:
                 break
             time_index = int(tokens[i + 1].split("=")[1])
-            pitch = int(tokens[i + 2].split("=")[1])
+            pitch_key, pitch_value = tokens[i + 2].split("=", 1)
+            pitch = int(pitch_value)
             program = 0
             if include_program:
                 program = int(tokens[i + 3].split("=")[1])
+            elif pitch_key == "drum_pitch":
+                program = 128
             key_pitch_program = (pitch, program)
 
             if key_pitch_program in note_dict and len(note_dict[key_pitch_program]) > 0:

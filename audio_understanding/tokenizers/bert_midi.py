@@ -9,9 +9,10 @@ class BertMIDI:
     r"""Extend text tokenizer with discrete audio codec vocabularies.
     """
     
-    def __init__(self) -> None:
+    def __init__(self, drum_pitch: bool = False) -> None:
 
         super().__init__()
+        self.drum_pitch = drum_pitch
 
         self.tok = AutoTokenizer.from_pretrained("bert-base-uncased")
 
@@ -22,6 +23,8 @@ class BertMIDI:
         new_vocabs += ["name=pedal_onset", "name=pedal_sustain", "name=pedal_offset"]
 
         new_vocabs += ["pitch={}".format(p) for p in range(128)]
+        if self.drum_pitch:
+            new_vocabs += ["drum_pitch={}".format(p) for p in range(128)]
         new_vocabs += ["velocity={}".format(v) for v in range(128)]
         new_vocabs += ["program={}".format(p) for p in range(129)] #* 129 because program=128 is used for drums
 
