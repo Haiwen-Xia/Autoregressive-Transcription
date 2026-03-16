@@ -606,6 +606,7 @@ class Slakh2100(Dataset):
             note_with_offset_f1,
             program_aware_f1,
             per_instrument_metrics,
+            drum_f1,
         )
 
         start_time = data["start_time"]
@@ -651,6 +652,7 @@ class Slakh2100(Dataset):
         results = {
             "note_onset":  note_onset_f1(ref_notes, est_notes),
             "note_offset": note_with_offset_f1(ref_notes, est_notes),
+            "drum":      drum_f1(ref_notes, est_notes),  
         }
         # Detect X2one scenario: model has no program output but ground truth
         # targets exactly one instrument — assign that program to all estimates.

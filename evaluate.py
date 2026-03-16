@@ -59,20 +59,33 @@ def find_latest_checkpoint(ckpt_dir: Path) -> Path:
 # Dataset builder
 # ---------------------------------------------------------------------------
 
-def get_eval_dataset(configs: dict, use_train: bool, segment: bool = False) -> tuple[Any, str]:
+def get_eval_dataset(
+    configs: dict,
+    use_train: bool,
+    segment: bool = False,
+    segment_fixed_clip: bool = False,
+) -> tuple[Any, str]:
     """Build the test dataset from config and return ``(dataset, dataset_name)``.
 
     Args:
         segment: if True, build with RandomCrop (for segment-wise eval).
                  if False, build with crop=None (for song-wise eval).
+        segment_fixed_clip: when segment=True, use deterministic StartCrop
+            so each sample always evaluates the same clip.
     """
     from audidata.transforms import Mono
-    from audidata.io.crops import RandomCrop
+    from audidata.io.crops import RandomCrop, StartCrop
 
     sr = configs["sample_rate"]
     clip_duration = configs["clip_duration"]
     test_datasets_cfg = configs["train_datasets"] if use_train else configs["test_datasets"]
-    crop = RandomCrop(clip_duration=clip_duration, end_pad=clip_duration - 0.1) if segment else None
+    if segment:
+        if segment_fixed_clip:
+            crop = StartCrop(clip_duration=clip_duration)
+        else:
+            crop = RandomCrop(clip_duration=clip_duration, end_pad=clip_duration - 0.1)
+    else:
+        crop = None
 
     for name, ds_cfg in test_datasets_cfg.items():
 
@@ -877,8 +890,15 @@ def main_func(args: argparse.Namespace) -> None:
 
     # Build test dataset
     is_segment = (eval_mode == "segment")
-    dataset, dataset_name = get_eval_dataset(configs, args.use_train, segment=is_segment)
+    dataset, dataset_name = get_eval_dataset(
+        configs,
+        args.use_train,
+        segment=is_segment,
+        segment_fixed_clip=args.segment_fixed_clip,
+    )
     print(f"Dataset: {dataset_name}, eval_mode: {eval_mode}, samples: {len(dataset)}")
+    if is_segment and args.segment_fixed_clip:
+        print("Segment eval uses fixed StartCrop (deterministic clip per sample).")
 
     eval_metrics = {}
     additional_info = {
@@ -886,6 +906,7 @@ def main_func(args: argparse.Namespace) -> None:
         "dataset": dataset_name,
         "eval_mode": eval_mode,
         "max_samples": args.max_samples,
+        "segment_fixed_clip": bool(args.segment_fixed_clip),
     }
 
     # --- Evaluate ---
@@ -1016,6 +1037,11 @@ def main() -> None:
         "--use_train",
         action="store_true",
         help="Use the training split instead of the test split.",
+    )
+    parser.add_argument(
+        "--segment_fixed_clip",
+        action="store_true",
+        help="In segment mode, use deterministic StartCrop instead of RandomCrop.",
     )
     args = parser.parse_args()
     main_func(args)

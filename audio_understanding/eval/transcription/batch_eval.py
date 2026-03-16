@@ -26,6 +26,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from audio_understanding.eval.transcription.metrics import (
+    drum_f1,
     instrument_summary,
     note_onset_f1,
     note_with_offset_f1,
@@ -39,15 +40,84 @@ from audio_understanding.eval.transcription.metrics import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _avg_metric(metrics_list: list[dict]) -> dict:
-    r"""Average precision / recall / F1 across a list of metric dicts."""
-    if not metrics_list:
-        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
-    return {
-        "precision": float(np.mean([m["precision"] for m in metrics_list])),
-        "recall":    float(np.mean([m["recall"]    for m in metrics_list])),
-        "f1":        float(np.mean([m["f1"]        for m in metrics_list])),
-    }
+def _is_scalar(value) -> bool:
+    return isinstance(value, (int, float, bool, np.integer, np.floating, np.bool_))
+
+
+def _mean_scalar(values: list) -> float:
+    assert len(values) > 0
+    return float(np.mean([float(v) for v in values]))
+
+
+def _representative_value(values: list):
+    """Return a stable representative value for non-numeric leaves.
+
+    If all values are identical, return that value.
+    Otherwise, return the majority value (first occurrence wins ties).
+    """
+    assert len(values) > 0
+    first = values[0]
+    if all(v == first for v in values):
+        return first
+
+    counts: dict[object, int] = {}
+    first_idx: dict[object, int] = {}
+    for i, v in enumerate(values):
+        counts[v] = counts.get(v, 0) + 1
+        if v not in first_idx:
+            first_idx[v] = i
+
+    best = max(counts.keys(), key=lambda v: (counts[v], -first_idx[v]))
+    return best
+
+
+def _recursive_avg(values: list):
+    """Recursively average a homogeneous list of scalars / dicts."""
+    assert len(values) > 0
+
+    first = values[0]
+    if _is_scalar(first):
+        return _mean_scalar(values)
+
+    if isinstance(first, dict):
+        out: dict = {}
+        all_keys = set()
+        for v in values:
+            assert isinstance(v, dict)
+            all_keys.update(v.keys())
+        for k in all_keys:
+            child_values = [v[k] for v in values if k in v]
+            if not child_values:
+                continue
+            out[k] = _recursive_avg(child_values)
+        return out
+
+    # For non-numeric leaves (e.g. inst_class), keep a stable representative.
+    return _representative_value(values)
+
+
+def _is_single_layer_summary_value(value) -> bool:
+    """Keep only scalar or one-level dict values in summary."""
+    if _is_scalar(value):
+        return True
+    if isinstance(value, dict):
+        return all(_is_scalar(v) for v in value.values())
+    return False
+
+
+def _merge_result_accumulator(acc: dict[str, list], result: dict) -> None:
+    for k, v in result.items():
+        if k not in acc:
+            acc[k] = []
+        acc[k].append(v)
+
+
+def _finalize_result_accumulator(acc: dict[str, list]) -> dict:
+    summary: dict = {}
+    for k, values in acc.items():
+        assert len(values) > 0
+        summary[k] = _recursive_avg(values)
+    return summary
 
 
 def _quantize_to_fps_grid(value: float, fps: float) -> float:
@@ -163,6 +233,9 @@ def _evaluate_cropped_item(
     note_is_drum = data.get("note_is_drum", [])
     notes = data.get("note", [])
     has_inst_meta = len(note_programs) == len(notes) and len(notes) > 0
+    if has_inst_meta:
+        result["drum"] = drum_f1(ref_notes, est_notes)
+
     single_program = None
     single_is_drum = False
     if has_inst_meta and not include_program:
@@ -231,10 +304,7 @@ def batch_evaluate(
     dataset_name = type(dataset).__name__
 
     # Per-sample accumulators
-    onset_list: list[dict] = []
-    offset_list: list[dict] = []
-    program_aware_list: list[dict] = []
-    per_inst_list: list[dict] = []
+    result_acc: dict[str, list] = {}
     empty_ref_count = 0
     empty_pred_correct = 0
     evaluated_items = 0
@@ -293,22 +363,21 @@ def batch_evaluate(
                 f"onset_f1={onset_f1:.4f}"
             )
 
-        onset_list.append(result["note_onset"])
-        offset_list.append(result["note_offset"])
-
-        if "program_aware" in result:
-            program_aware_list.append(result["program_aware"])
-        if "per_instrument" in result:
-            per_inst_list.append(result["per_instrument"])
+        _merge_result_accumulator(result_acc, result)
 
     summary: dict = {
-        "n_samples": len(onset_list),
+        "n_samples": int(len(next(iter(result_acc.values()))) if result_acc else 0),
         "epochs": int(epochs),
         "evaluated_items": int(evaluated_items),
         "empty_ref_samples": int(empty_ref_count),
-        "note_onset": _avg_metric(onset_list),
-        "note_offset": _avg_metric(offset_list),
     }
+
+    agg_result = _finalize_result_accumulator(result_acc)
+    for k, v in agg_result.items():
+        if k.startswith("_"):
+            continue
+        if _is_single_layer_summary_value(v):
+            summary[k] = v
 
     if empty_ref_count > 0:
         summary["empty_audio_pred_acc"] = {
@@ -317,10 +386,7 @@ def batch_evaluate(
             "acc": float(empty_pred_correct / empty_ref_count),
         }
 
-    if program_aware_list:
-        summary["program_aware"] = _avg_metric(program_aware_list)
-
-    if per_inst_list:
-        summary["instrument_summary"] = instrument_summary(per_inst_list)
+    if "per_instrument" in result_acc:
+        summary["instrument_summary"] = instrument_summary(result_acc["per_instrument"])
 
     return summary

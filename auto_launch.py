@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -25,12 +26,20 @@ def _normalize_gpu_ids(raw: str) -> tuple[str, int]:
     return normalized, len(parts)
 
 
+def _pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
 def build_launch_command(
     python_exe: str,
     train_script: Path,
     train_accelerate_script: Path,
     gpu_ids: str,
     nproc: int,
+    main_process_port: int,
     passthrough: list[str],
 ) -> tuple[list[str], dict[str, str]]:
     env = os.environ.copy()
@@ -47,8 +56,8 @@ def build_launch_command(
         gpu_ids,
         "--num_processes",
         str(nproc),
-        # "--main_process_port",
-        # "0",
+        "--main_process_port",
+        str(main_process_port),
         str(train_accelerate_script),
         *passthrough,
     ]
@@ -66,19 +75,27 @@ def main_func(args: argparse.Namespace) -> int:
     train_script = base_dir / "train.py"
     train_accelerate_script = base_dir / "train_accelerate.py"
 
+    launch_port = args.main_process_port
+    if nproc > 1 and launch_port == 0:
+        launch_port = _pick_free_port()
+
     cmd, env = build_launch_command(
         python_exe=sys.executable,
         train_script=train_script,
         train_accelerate_script=train_accelerate_script,
         gpu_ids=gpu_ids,
         nproc=nproc,
+        main_process_port=launch_port,
         passthrough=args.train_args,
     )
 
     if nproc <= 1:
         print("[auto_launch] CPU launch:")
     else:
-        print(f"[auto_launch] Multi-GPU launch: CUDA_VISIBLE_DEVICES={gpu_ids}, num_processes={nproc}")
+        print(
+            f"[auto_launch] Multi-GPU launch: "
+            f"CUDA_VISIBLE_DEVICES={gpu_ids}, num_processes={nproc}, main_process_port={launch_port}"
+        )
     print("  " + shlex.join(cmd))
 
     proc = subprocess.Popen(cmd, env=env)
@@ -102,11 +119,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("gpu_ids", type=str, help="GPU ids like '0' or '0,1'; use 'cpu' for CPU run")
     parser.add_argument(
-        "train_args",
-        nargs=argparse.REMAINDER,
-        help="Arguments passed through to train scripts (Hydra style)",
+        "--main_process_port",
+        type=int,
+        default=0,
+        help="Port for distributed init in multi-GPU mode. Use 0 to auto-select a free port.",
     )
-    parsed = parser.parse_args(argv[1:])
+    parsed, train_args = parser.parse_known_args(argv[1:])
+    parsed.train_args = train_args
 
     if parsed.train_args and parsed.train_args[0] == "--":
         parsed.train_args = parsed.train_args[1:]
