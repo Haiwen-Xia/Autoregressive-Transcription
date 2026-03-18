@@ -21,7 +21,7 @@ test_datasets:
 midi_to_tokens: MIDI2Tokens
         
 audio_encoder:
-    name: MERT # Conformer2d
+    name: PianoTranscriptionCRnn # Conformer2d
     trainable: True
     
     # random_init: True  # True: from scratch (random init), False: load pretrained from piano_transcription_inference
@@ -40,7 +40,7 @@ llm:
     n_embd: 768
     
 train:
-    device: "cuda:0"
+    device: "cuda:1"
     num_workers: 12
     remove_padded_columns: True
     loss: ce_loss
@@ -51,6 +51,6 @@ train:
     test_every_n_steps: 1000
     save_every_n_steps: 10000
     training_steps: 100000
-    resume_ckpt_path:  # Leave blank if train from scratch
+    resume_ckpt_path: #/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/checkpoints/train/piano_transcription_maestro/ckpt/step=60000.pth # /data/yrb/musicarena/Haiwen/Autoregressive-Transcription/maestro/20260307-145109_MERT/ckpt/step=100000.pth # Leave blank if train from scratch
 
 no_log: false

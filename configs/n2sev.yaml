@@ -6,32 +6,32 @@ max_answering_len: 1000
 fps: 100
 output_root: "./slakh/n2sev"
 run_name: n2sev
-midi_include_program: False
+midi_include_program: true
 
 train_datasets:
     Slakh2100:
         root: "/data/yrb/musicarena/Haiwen/slakh2100/slakh2100_flac_redux"
         split: "train"
         mode: all2several
-        sample_num: 1
+        sample_num: 10
         keep_track_info: False
         question:
             default: "Transcribe this audio."
-            instrument_repr: name_program
+            instrument_repr: name
             instrument_info_dropout: 0.0
             template: "Transcribe only these instruments from this audio: {targets}."
 
 
-test_datasets:
+test_datasets: #* 稍微改一下加载逻辑就好
     Slakh2100:
         root: "/data/yrb/musicarena/Haiwen/slakh2100/slakh2100_flac_redux"
         split: "test"
         mode: all2several
-        sample_num: 1
+        sample_num: 10
         keep_track_info: False
         question:
             default: "Transcribe this audio."
-            instrument_repr: name_program
+            instrument_repr: name
             instrument_info_dropout: 0.0
             template: "Transcribe only these instruments from this audio: {targets}."
 
