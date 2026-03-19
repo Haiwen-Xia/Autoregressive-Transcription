@@ -54,7 +54,6 @@ def parse_tokens_to_notes(
     start_time: float = 0.0,
     clip_duration: Optional[float] = None,
     exclude_boundary: bool = False,
-    ignore_program: bool = False
 ) -> list[dict]:
     r"""Parse a MIDI token sequence into a list of note event dicts.
 
@@ -70,9 +69,6 @@ def parse_tokens_to_notes(
         fps: frames per second used to encode time (time_index / fps = seconds
             from clip start).
         include_program: whether ``program=X`` tokens appear in each event.
-        ignore_program: when True and include_program=True, ignore predicted
-            per-instrument program IDs by normalizing all non-drum notes to
-            program 0 and all drum notes to :data:`DRUM_PROGRAM`.
         start_time: absolute clip start time added to all output times.
         clip_duration: optional clip duration in seconds. When provided,
             onset-only notes are closed at ``start_time + clip_duration``.
@@ -124,20 +120,9 @@ def parse_tokens_to_notes(
             }
             if include_program:
                 try:
-                    note_program = int(tokens[i + 4].split("=")[1])
+                    note["program"] = int(tokens[i + 4].split("=")[1])
                 except (ValueError, IndexError):
-                    note_program = 0
-
-                if ignore_program:
-                    if pitch_key == "drum_pitch":
-                        note["program"] = DRUM_PROGRAM
-                        note["is_drum"] = True
-                    else:
-                        note["program"] = 0
-                else:
-                    note["program"] = note_program
-                    if pitch_key == "drum_pitch":
-                        note["is_drum"] = True
+                    note["program"] = 0
             elif pitch_key == "drum_pitch":
                 note["program"] = DRUM_PROGRAM
                 note["is_drum"] = True
@@ -166,8 +151,6 @@ def parse_tokens_to_notes(
                     close_program = int(tokens[i + 3].split("=")[1])
                 except (ValueError, IndexError):
                     close_program = 0
-                if ignore_program:
-                    close_program = DRUM_PROGRAM if pitch_key == "drum_pitch" else 0
                 close_key = (pitch, close_program)
             elif pitch_key == "drum_pitch":
                 close_key = (pitch, DRUM_PROGRAM)
@@ -201,8 +184,6 @@ def parse_tokens_to_notes(
                     }
                     if include_program:
                         note["program"] = int(close_program)
-                        if pitch_key == "drum_pitch":
-                            note["is_drum"] = True
                     elif pitch_key == "drum_pitch":
                         note["program"] = DRUM_PROGRAM
                         note["is_drum"] = True
@@ -262,8 +243,6 @@ def _match_greedy(
     check_program: bool,
     offset_ratio: float = OFFSET_RATIO,
     offset_min_tol: float = OFFSET_MIN_TOL,
-    exclude_drums: bool = True,
-    drum_only: bool = False
 ) -> tuple[int, int, int]:
     r"""Greedy note matching sorted by onset time.
 
@@ -273,31 +252,11 @@ def _match_greedy(
     Returns:
         ``(true_positives, false_positives, false_negatives)``
     """
+    if not ref_notes or not est_notes:
+        return 0, len(est_notes), len(ref_notes)
+
     ref_sorted = sorted(ref_notes, key=lambda n: (n["onset_time"], n["pitch"]))
     est_sorted = sorted(est_notes, key=lambda n: (n["onset_time"], n["pitch"]))
-
-    if drum_only:
-        ref_sorted = [
-            n for n in ref_sorted
-            if n.get("is_drum") or n.get("program") == DRUM_PROGRAM
-        ]
-        est_sorted = [
-            n for n in est_sorted
-            if n.get("is_drum") or n.get("program") == DRUM_PROGRAM
-        ]
-    elif exclude_drums:
-        ref_sorted = [
-            n for n in ref_sorted
-            if not n.get("is_drum") and n.get("program") != DRUM_PROGRAM
-        ]
-        est_sorted = [
-            n for n in est_sorted
-            if not n.get("is_drum") and n.get("program") != DRUM_PROGRAM
-        ]
-
-    if not ref_sorted or not est_sorted:
-        return 0, len(est_sorted), len(ref_sorted)
-
     matched_est = [False] * len(est_sorted)
     tp = 0
 
@@ -305,7 +264,6 @@ def _match_greedy(
         best_j = -1
         best_dt = float("inf")
 
-        # for unmatched est in onset order, find the closest that meets the criteria
         for j, est in enumerate(est_sorted):
             if matched_est[j]:
                 continue
@@ -373,38 +331,31 @@ def note_onset_f1(
         onset_tol=onset_tol,
         check_offset=False,
         check_program=False,
-        exclude_drums=True,
     )
     return _prf(tp, tp + fn, tp + fp)
+
 
 def drum_f1(
     ref_notes: list[dict],
     est_notes: list[dict],
     onset_tol: float = ONSET_TOL,
 ) -> dict:
-    r"""Drum note onset precision / recall / F1 (offset ignored).
+    r"""Drum-only note onset precision / recall / F1.
 
-    A match requires identical pitch and onset within *onset_tol* seconds, and
-    both notes must be drums (``is_drum=True`` or ``program=DRUM_PROGRAM``).
-
-    Args:
-        ref_notes: reference note dicts with at least ``onset_time``, ``pitch``,
-            and either ``program`` (int) or ``is_drum`` (bool).
-        est_notes: estimated note dicts with the same fields.
-        onset_tol: maximum onset time difference in seconds.
-
-    Returns:
-        ``{"precision": float, "recall": float, "f1": float}``
+    Drums are identified by ``is_drum=True`` or ``program=DRUM_PROGRAM``.
     """
-    tp, fp, fn = _match_greedy(
-        ref_notes, est_notes,
-        onset_tol=onset_tol,
-        check_offset=False,
-        check_program=False,
-        exclude_drums=False,
-        drum_only=True,
-    )
-    return _prf(tp, tp + fn, tp + fp)
+
+    ref_drum = [
+        n for n in ref_notes
+        if bool(n.get("is_drum", False)) or int(n.get("program", -1)) == DRUM_PROGRAM
+    ]
+    est_drum = [
+        n for n in est_notes
+        if bool(n.get("is_drum", False)) or int(n.get("program", -1)) == DRUM_PROGRAM
+    ]
+
+    return note_onset_f1(ref_drum, est_drum, onset_tol=onset_tol)
+
 
 def note_with_offset_f1(
     ref_notes: list[dict],

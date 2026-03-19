@@ -710,7 +710,7 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
         logging.info("Loaded audio encoder weights from %s", configs["audio_encoder"]["ckpt_path"])
         
     if ckpt_path:
-        ckpt = torch.load(ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location="cpu")
         if "audio_encoder" in ckpt:
             model.load_state_dict(ckpt["audio_encoder"])
             logging.info("Loaded audio encoder weights from joint checkpoint %s", ckpt_path)
@@ -755,6 +755,8 @@ def get_llm(configs: dict, audio_latent_dim: int, vocab_size: int, ckpt_path: st
         n_layer = configs["llm"]["n_layer"]
         n_head = configs["llm"]["n_head"]
         n_embd = configs["llm"]["n_embd"]
+        audio_use_absolute_pe = bool(configs["llm"].get("audio_use_absolute_pe", False))
+        rope_scope = str(configs["llm"].get("rope_scope", "all"))
 
         config = LlamaConfig(
             block_size=block_size,
@@ -763,6 +765,8 @@ def get_llm(configs: dict, audio_latent_dim: int, vocab_size: int, ckpt_path: st
             n_layer=n_layer,
             n_head=n_head,
             n_embd=n_embd,
+            audio_use_absolute_pe=audio_use_absolute_pe,
+            rope_scope=rope_scope,
         )
         model = Llama(config=config)
 
@@ -806,7 +810,7 @@ def get_llm(configs: dict, audio_latent_dim: int, vocab_size: int, ckpt_path: st
         model.load_state_dict(filtered_ckpt, strict=False) #* there is no state dict key for llm key 
         logging.info("Loaded LLM weights from %s", configs["llm"]["ckpt_path"])
     if ckpt_path:
-        ckpt = torch.load(ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location="cpu")
         if "llm" in ckpt:
             model.load_state_dict(ckpt["llm"])
             logging.info("Loaded LLM weights from joint checkpoint %s", ckpt_path)

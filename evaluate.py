@@ -35,6 +35,58 @@ from audio_understanding.utils import parse_yaml
 from train import get_audio_encoder, get_llm, get_tokenizer
 
 
+VOCAB_PREFIX_KEYS = [
+    "time_index_after_note_onset",
+    "time_index_after_note_offset",
+    "time_index_other",
+    "name",
+    "pitch",
+    "drum_pitch",
+    "velocity",
+    "program",
+]
+
+
+def _token_prefix(token: str, prev_token: str = "") -> str:
+    if token in ("[CLS]", "[SEP]", "[PAD]"):
+        return "special"
+    if "=" in token:
+        prefix = token.split("=", 1)[0]
+        if prefix == "time_index":
+            if prev_token in ("name=note_onset", "name=note_on"):
+                return "time_index_after_note_onset"
+            if prev_token in ("name=note_offset", "name=note_off"):
+                return "time_index_after_note_offset"
+            return "time_index_other"
+        return prefix
+    return "text"
+
+
+def _finalize_vocab_prefix_stats(raw_stats: dict[str, dict]) -> dict[str, dict]:
+    prefix_stats = {}
+    for prefix in VOCAB_PREFIX_KEYS:
+        bucket = raw_stats.get(prefix, {"count": 0, "ce_sum": 0.0})
+        count = int(bucket["count"])
+        prefix_stats[prefix] = {
+            "count": count,
+            "mean_ce": float(bucket["ce_sum"] / max(count, 1)),
+        }
+
+    other_prefixes = sorted(
+        p for p in raw_stats.keys()
+        if p not in VOCAB_PREFIX_KEYS and p != "special"
+    )
+    for prefix in other_prefixes:
+        bucket = raw_stats[prefix]
+        count = int(bucket["count"])
+        prefix_stats[prefix] = {
+            "count": count,
+            "mean_ce": float(bucket["ce_sum"] / max(count, 1)),
+        }
+
+    return prefix_stats
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
@@ -59,33 +111,20 @@ def find_latest_checkpoint(ckpt_dir: Path) -> Path:
 # Dataset builder
 # ---------------------------------------------------------------------------
 
-def get_eval_dataset(
-    configs: dict,
-    use_train: bool,
-    segment: bool = False,
-    segment_fixed_clip: bool = False,
-) -> tuple[Any, str]:
+def get_eval_dataset(configs: dict, use_train: bool, segment: bool = False) -> tuple[Any, str]:
     """Build the test dataset from config and return ``(dataset, dataset_name)``.
 
     Args:
         segment: if True, build with RandomCrop (for segment-wise eval).
                  if False, build with crop=None (for song-wise eval).
-        segment_fixed_clip: when segment=True, use deterministic StartCrop
-            so each sample always evaluates the same clip.
     """
     from audidata.transforms import Mono
-    from audidata.io.crops import RandomCrop, StartCrop
+    from audidata.io.crops import RandomCrop
 
     sr = configs["sample_rate"]
     clip_duration = configs["clip_duration"]
     test_datasets_cfg = configs["train_datasets"] if use_train else configs["test_datasets"]
-    if segment:
-        if segment_fixed_clip:
-            crop = StartCrop(clip_duration=clip_duration)
-        else:
-            crop = RandomCrop(clip_duration=clip_duration, end_pad=clip_duration - 0.1)
-    else:
-        crop = None
+    crop = RandomCrop(clip_duration=clip_duration, end_pad=clip_duration - 0.1) if segment else None
 
     for name, ds_cfg in test_datasets_cfg.items():
 
@@ -417,6 +456,7 @@ def _compute_teacher_forced_ce_and_logits(
     device: str,
     top_k: int = 5,
     max_trace_steps: int = 16,
+    collect_vocab_prefix_stats: bool = False,
 ) -> dict:
     audio = data["audio"]
     if not isinstance(audio, torch.Tensor):
@@ -485,12 +525,40 @@ def _compute_teacher_forced_ce_and_logits(
             }
         )
 
-    return {
+    vocab_prefix_stats = None
+    if collect_vocab_prefix_stats:
+        raw_prefix_stats: dict[str, dict] = {}
+        steps = targets.shape[1]
+        target_token_ids = [int(targets[0, step].item()) for step in range(steps)]
+        target_tokens_seq = [str(tok.tok.convert_ids_to_tokens([tid])[0]) for tid in target_token_ids]
+        for step in range(steps):
+            if not bool(valid_mask[0, step]):
+                continue
+
+            token = target_tokens_seq[step]
+            prev_token = target_tokens_seq[step - 1] if step > 0 else ""
+            prefix = _token_prefix(token, prev_token=prev_token)
+            if prefix == "special":
+                continue
+
+            bucket = raw_prefix_stats.setdefault(
+                prefix,
+                {"count": 0, "ce_sum": 0.0},
+            )
+            bucket["count"] += 1
+            bucket["ce_sum"] += float(token_losses[0, step].item())
+
+        vocab_prefix_stats = _finalize_vocab_prefix_stats(raw_prefix_stats)
+
+    result = {
         "mean_ce": mean_ce,
         "valid_token_count": valid_token_count,
         "target_logits": [float(x) for x in valid_target_logits],
         "logit_trace": trace,
     }
+    if collect_vocab_prefix_stats:
+        result["vocab_prefix_stats"] = vocab_prefix_stats
+    return result
 
 
 def _build_transcription_target_tokens(
@@ -653,6 +721,7 @@ def collect_transcription_teacher_forced_stats(
     device: str,
     include_program: bool,
     max_samples: int | None,
+    collect_vocab_prefix_stats: bool = False,
 ) -> tuple[dict, list[dict]]:
     n_total = len(dataset)
     if max_samples is not None:
@@ -661,6 +730,7 @@ def collect_transcription_teacher_forced_stats(
     ce_values = []
     token_counts = []
     per_sample = []
+    vocab_prefix_agg: dict[str, dict] = {}
 
     try:
         from tqdm import tqdm
@@ -687,29 +757,44 @@ def collect_transcription_teacher_forced_stats(
             tokenizer=tokenizer,
             configs=configs,
             device=device,
+            collect_vocab_prefix_stats=collect_vocab_prefix_stats,
         )
 
         ce_values.append(ce_info["mean_ce"])
         token_counts.append(ce_info["valid_token_count"])
-        per_sample.append(
-            {
-                "sample_index": int(i),
-                "audio_path": data.get("audio_path", ""),
-                "midi_path": data.get("midi_path", ""),
-                "question": data.get("question", ""),
-                "target_token_num": len(target_tokens),
-                "valid_token_count": ce_info["valid_token_count"],
-                "mean_ce": ce_info["mean_ce"],
-                "target_logit_mean": float(sum(ce_info["target_logits"]) / max(len(ce_info["target_logits"]), 1)),
-                "logit_trace": ce_info["logit_trace"],
-            }
-        )
+        if collect_vocab_prefix_stats:
+            sample_prefix_stats = ce_info["vocab_prefix_stats"]
+            for prefix, stats in sample_prefix_stats.items():
+                bucket = vocab_prefix_agg.setdefault(
+                    prefix,
+                    {"count": 0, "ce_sum": 0.0},
+                )
+                count = int(stats["count"])
+                bucket["count"] += count
+                bucket["ce_sum"] += float(stats["mean_ce"]) * count
+
+        sample_detail = {
+            "sample_index": int(i),
+            "audio_path": data.get("audio_path", ""),
+            "midi_path": data.get("midi_path", ""),
+            "question": data.get("question", ""),
+            "target_token_num": len(target_tokens),
+            "valid_token_count": ce_info["valid_token_count"],
+            "mean_ce": ce_info["mean_ce"],
+            "target_logit_mean": float(sum(ce_info["target_logits"]) / max(len(ce_info["target_logits"]), 1)),
+            "logit_trace": ce_info["logit_trace"],
+        }
+        if collect_vocab_prefix_stats:
+            sample_detail["vocab_prefix_stats"] = ce_info["vocab_prefix_stats"]
+        per_sample.append(sample_detail)
 
     summary = {
         "samples": int(len(ce_values)),
         "mean_ce": float(sum(ce_values) / max(len(ce_values), 1)),
         "total_valid_tokens": int(sum(token_counts)),
     }
+    if collect_vocab_prefix_stats:
+        summary["vocab_prefix_stats"] = _finalize_vocab_prefix_stats(vocab_prefix_agg)
     return summary, per_sample
 
 
@@ -739,6 +824,7 @@ def run_text_evaluation(
     configs: dict,
     device: str,
     max_samples: int | None = None,
+    collect_vocab_prefix_stats: bool = False,
 ) -> tuple[list[dict], dict, list[dict]]:
     """Run greedy inference on text-output datasets and print sample results.
 
@@ -765,6 +851,7 @@ def run_text_evaluation(
     results = []
     ce_values = []
     ce_details = []
+    vocab_prefix_agg: dict[str, dict] = {}
     for i in iterator:
         data = dataset[i]
 
@@ -808,8 +895,19 @@ def run_text_evaluation(
             tokenizer=tokenizer,
             configs=configs,
             device=device,
+            collect_vocab_prefix_stats=collect_vocab_prefix_stats,
         )
         ce_values.append(ce_info["mean_ce"])
+        if collect_vocab_prefix_stats:
+            sample_prefix_stats = ce_info["vocab_prefix_stats"]
+            for prefix, stats in sample_prefix_stats.items():
+                bucket = vocab_prefix_agg.setdefault(
+                    prefix,
+                    {"count": 0, "ce_sum": 0.0},
+                )
+                count = int(stats["count"])
+                bucket["count"] += count
+                bucket["ce_sum"] += float(stats["mean_ce"]) * count
 
         results.append(
             {
@@ -822,18 +920,19 @@ def run_text_evaluation(
             }
         )
 
-        ce_details.append(
-            {
-                "sample_index": int(i),
-                "audio_path": data.get("audio_path", ""),
-                "question": question,
-                "target": target,
-                "valid_token_count": ce_info["valid_token_count"],
-                "mean_ce": ce_info["mean_ce"],
-                "target_logits": ce_info["target_logits"],
-                "logit_trace": ce_info["logit_trace"],
-            }
-        )
+        ce_detail = {
+            "sample_index": int(i),
+            "audio_path": data.get("audio_path", ""),
+            "question": question,
+            "target": target,
+            "valid_token_count": ce_info["valid_token_count"],
+            "mean_ce": ce_info["mean_ce"],
+            "target_logits": ce_info["target_logits"],
+            "logit_trace": ce_info["logit_trace"],
+        }
+        if collect_vocab_prefix_stats:
+            ce_detail["vocab_prefix_stats"] = ce_info["vocab_prefix_stats"]
+        ce_details.append(ce_detail)
 
         if i < 5:
             print(f"  [Sample {i}] Q: {question!r}")
@@ -845,6 +944,8 @@ def run_text_evaluation(
         "samples": int(len(ce_values)),
         "mean_ce": float(sum(ce_values) / max(len(ce_values), 1)),
     }
+    if collect_vocab_prefix_stats:
+        ce_summary["vocab_prefix_stats"] = _finalize_vocab_prefix_stats(vocab_prefix_agg)
 
     return results, ce_summary, ce_details
 
@@ -873,8 +974,10 @@ def main_func(args: argparse.Namespace) -> None:
 
     device = args.device
     eval_mode = args.eval_mode
+    configs['train']['device'] = device
 
     # Build models
+    print(f"Building models on device: {device}, train.device = {configs['train'].get('device', 'not set')}")
     audio_encoder = get_audio_encoder(configs=configs, ckpt_path=str(ckpt_path)).to(device)
     tokenizer = get_tokenizer(configs=configs)
     audio_latent_dim = int(getattr(cast(Any, audio_encoder), "latent_dim"))
@@ -890,15 +993,8 @@ def main_func(args: argparse.Namespace) -> None:
 
     # Build test dataset
     is_segment = (eval_mode == "segment")
-    dataset, dataset_name = get_eval_dataset(
-        configs,
-        args.use_train,
-        segment=is_segment,
-        segment_fixed_clip=args.segment_fixed_clip,
-    )
+    dataset, dataset_name = get_eval_dataset(configs, args.use_train, segment=is_segment)
     print(f"Dataset: {dataset_name}, eval_mode: {eval_mode}, samples: {len(dataset)}")
-    if is_segment and args.segment_fixed_clip:
-        print("Segment eval uses fixed StartCrop (deterministic clip per sample).")
 
     eval_metrics = {}
     additional_info = {
@@ -906,7 +1002,6 @@ def main_func(args: argparse.Namespace) -> None:
         "dataset": dataset_name,
         "eval_mode": eval_mode,
         "max_samples": args.max_samples,
-        "segment_fixed_clip": bool(args.segment_fixed_clip),
     }
 
     # --- Evaluate ---
@@ -951,6 +1046,7 @@ def main_func(args: argparse.Namespace) -> None:
             device=device,
             include_program=include_program,
             max_samples=transcription_max_samples,
+            collect_vocab_prefix_stats=args.teacher_forced_vocab_stats,
         )
         eval_metrics["teacher_forced_ce"] = ce_summary
         additional_info["teacher_forced_details"] = ce_details
@@ -969,6 +1065,7 @@ def main_func(args: argparse.Namespace) -> None:
             configs=configs,
             device=device,
             max_samples=args.max_samples,
+            collect_vocab_prefix_stats=args.teacher_forced_vocab_stats,
         )
 
         eval_metrics["teacher_forced_ce"] = ce_summary
@@ -1039,9 +1136,9 @@ def main() -> None:
         help="Use the training split instead of the test split.",
     )
     parser.add_argument(
-        "--segment_fixed_clip",
+        "--teacher_forced_vocab_stats",
         action="store_true",
-        help="In segment mode, use deterministic StartCrop instead of RandomCrop.",
+        help="Collect teacher-forced CE stats grouped by token prefix (e.g. time_index/name/pitch).",
     )
     args = parser.parse_args()
     main_func(args)

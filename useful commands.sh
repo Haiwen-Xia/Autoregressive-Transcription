@@ -32,3 +32,9 @@ python debug_train_eval.py --config-name all2all
 nohup python train.py --config-name maestro run_name=reproduce > logs/maestro_reproduce.log 2>&1 &
 
 nohup python train_slakh.py --config /data/yrb/musicarena/Haiwen/piano_transcription/configs/conformer2d_nopool.yaml > logs/conformer2d_nopool_w_decoder.log 2>&1 &
+
+
+
+[baseline_rope_all_no_abs] gpu=0 pid=12545 log=logs/maestro_pe_ablation/baseline_rope_all_no_abs.log
+[v1_audio_abs_text_rope] gpu=1 pid=12547 log=logs/maestro_pe_ablation/v1_audio_abs_text_rope.log
+[v2_audio_abs_global_rope] gpu=2 pid=12549 log=logs/maestro_pe_ablation/v2_audio_abs_global_rope.log

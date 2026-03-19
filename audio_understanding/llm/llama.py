@@ -19,6 +19,8 @@ class LlamaConfig:
     n_layer: int = 32
     n_head: int = 32
     n_embd: int = 4096
+    audio_use_absolute_pe: bool = False
+    rope_scope: str = "all"
 
 
 # Default Llama configurations
@@ -37,6 +39,7 @@ class Llama(nn.Module):
         super().__init__()
 
         self.config = config
+        assert self.config.rope_scope in ["all", "text_only"]
 
         # Audio to embedding
         self.a2e = nn.Linear(config.audio_latent_dim, config.n_embd)
@@ -58,6 +61,13 @@ class Llama(nn.Module):
             head_dim=config.n_embd // config.n_head,
         )  # shape: (t, head_dim/2, 2)
         self.register_buffer(name="rope", tensor=rope)
+
+        if config.audio_use_absolute_pe:
+            abs_pe = build_sincos_absolute_pe(
+                seq_len=config.block_size,
+                dim=config.n_embd,
+            )  # shape: (t, d)
+            self.register_buffer(name="audio_abs_pe", tensor=abs_pe)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -99,9 +109,11 @@ class Llama(nn.Module):
         if mask is None:
             mask = build_causal_mask(seq_len=T).to(device)
 
+        rope_apply_mask = self.build_rope_apply_mask(seqs=seqs, seq_types=seq_types, seq_len=T, device=device)
+
         # Transformer
         for block in self.blocks:
-            x = block(x, self.rope, mask)
+            x = block(x, self.rope, mask, rope_apply_mask)
         # x: (b, t, d)
 
         # Output layers
@@ -127,6 +139,9 @@ class Llama(nn.Module):
 
             if seq_type == "audio":
                 x = self.a2e(seq)  # shape: (b, t_audio, d)
+                if self.config.audio_use_absolute_pe:
+                    t_audio = x.shape[1]
+                    x = x + self.audio_abs_pe[:t_audio].to(x.dtype).unsqueeze(0)
 
             elif seq_type == "id":
                 x = self.wte(seq)  # shape: (b, t_text, d)
@@ -139,6 +154,31 @@ class Llama(nn.Module):
         latent = torch.cat(latent, dim=1)  # shape: (b, t, d)
 
         return latent
+
+    def build_rope_apply_mask(
+        self,
+        seqs: list[torch.Tensor],
+        seq_types: list[str],
+        seq_len: int,
+        device: torch.device,
+    ) -> None | torch.Tensor:
+        if self.config.rope_scope == "all":
+            return None
+
+        assert self.config.rope_scope == "text_only"
+
+        mask_parts = []
+        for seq, seq_type in zip(seqs, seq_types):
+            t = seq.shape[1]
+            if seq_type == "audio":
+                mask_parts.append(torch.zeros(t, dtype=torch.bool, device=device))
+            else:
+                assert seq_type == "id"
+                mask_parts.append(torch.ones(t, dtype=torch.bool, device=device))
+
+        rope_apply_mask = torch.cat(mask_parts, dim=0)
+        assert rope_apply_mask.shape[0] == seq_len
+        return rope_apply_mask
 
     def latent_to_seqs(
         self, 
@@ -366,6 +406,7 @@ class Block(nn.Module):
         x: torch.Tensor,
         rope: torch.Tensor,
         mask: torch.Tensor,
+        rope_apply_mask: None | torch.Tensor,
     ) -> torch.Tensor:
         r"""
 
@@ -377,7 +418,7 @@ class Block(nn.Module):
         Outputs:
             x: (b, t, d)
         """
-        x = x + self.att(self.att_norm(x), rope, mask)
+        x = x + self.att(self.att_norm(x), rope, mask, rope_apply_mask)
         x = x + self.mlp(self.ffn_norm(x))
         return x
 
@@ -427,6 +468,7 @@ class CausalSelfAttention(nn.Module):
         x: torch.Tensor,
         rope: torch.Tensor,
         mask: torch.Tensor,
+        rope_apply_mask: None | torch.Tensor,
     ) -> torch.Tensor:
         r"""Causal self attention.
 
@@ -454,8 +496,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, D // self.n_head)
         # q, k, v shapes: (b, t, h, head_dim)
 
-        q = apply_rope(q, rope)
-        k = apply_rope(k, rope)
+        q = apply_rope(q, rope, rope_apply_mask=rope_apply_mask)
+        k = apply_rope(k, rope, rope_apply_mask=rope_apply_mask)
         # q, k shapes: (b, t, h, head_dim)
 
         k = k.transpose(1, 2)
@@ -512,3 +554,19 @@ def build_causal_mask(seq_len: int) -> torch.Tensor:
     ones = torch.ones((seq_len, seq_len), dtype=torch.bool)  # shape: (t, t)
     mask = torch.tril(ones)[None, None, :, :]  # shape: (1, 1, t, t)
     return mask
+
+
+def build_sincos_absolute_pe(seq_len: int, dim: int, base: int = 10000) -> torch.Tensor:
+    r"""Build sin-cos absolute positional embedding.
+
+    Outputs:
+        abs_pe: (t, d)
+    """
+    assert dim % 2 == 0
+    theta = 1.0 / (base ** (torch.arange(0, dim, 2) / dim))
+    seq_idx = torch.arange(seq_len)
+    idx_theta = torch.outer(seq_idx, theta).float()
+    abs_pe = torch.zeros((seq_len, dim), dtype=idx_theta.dtype)
+    abs_pe[:, 0::2] = torch.sin(idx_theta)
+    abs_pe[:, 1::2] = torch.cos(idx_theta)
+    return abs_pe

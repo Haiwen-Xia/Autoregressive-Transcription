@@ -31,7 +31,11 @@ def build_rope(
     return cache
 
 
-def apply_rope(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
+def apply_rope(
+    x: torch.Tensor,
+    rope_cache: torch.Tensor,
+    rope_apply_mask: None | torch.Tensor = None,
+) -> torch.Tensor:
     # truncate to support variable sizes
     T = x.size(1)
     rope_cache = rope_cache[:T]
@@ -48,4 +52,11 @@ def apply_rope(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
     )
 
     x_out2 = x_out2.flatten(3)
-    return x_out2.type_as(x)
+
+    if rope_apply_mask is None:
+        return x_out2.type_as(x)
+
+    # rope_apply_mask: (t,), True means applying RoPE at that position.
+    mask = rope_apply_mask[:T].view(1, T, 1, 1)
+    output = torch.where(mask, x_out2, x.float())
+    return output.type_as(x)

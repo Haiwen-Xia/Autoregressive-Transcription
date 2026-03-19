@@ -26,7 +26,7 @@ class BertMIDI:
         if self.drum_pitch:
             new_vocabs += ["drum_pitch={}".format(p) for p in range(128)]
         new_vocabs += ["velocity={}".format(v) for v in range(128)]
-        new_vocabs += ["program={}".format(p) for p in range(129)] #* 129 because program=128 is used for drums; prior works have been 128, leading to backward compatibility issues
+        new_vocabs += ["program={}".format(p) for p in range(129)] #* 129 because program=128 is used for drums
 
         # Merge text tokens and audio tokens
         print("Original vocab size: {}".format(len(self.tok)))
@@ -98,3 +98,9 @@ class BertMIDI:
     @property
     def eoa_token_id(self):
         return self.tok.convert_tokens_to_ids("<eoa>")
+if __name__ == "__main__":
+
+    tokenizer = BertMIDI(drum_pitch=True)
+    print(tokenizer.pad_token_id)
+    print(tokenizer.texts_to_ids(["Hello world!"], fix_length=10))
+    print(tokenizer.texts_to_ids([["Hello", "world", "!"]], fix_length=10))    

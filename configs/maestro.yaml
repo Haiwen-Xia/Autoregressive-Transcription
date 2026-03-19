@@ -52,5 +52,5 @@ train:
     save_every_n_steps: 10000
     training_steps: 100000
     resume_ckpt_path: #/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/checkpoints/train/piano_transcription_maestro/ckpt/step=60000.pth # /data/yrb/musicarena/Haiwen/Autoregressive-Transcription/maestro/20260307-145109_MERT/ckpt/step=100000.pth # Leave blank if train from scratch
-
+    transcription_eval_max_samples: 10
 no_log: false
