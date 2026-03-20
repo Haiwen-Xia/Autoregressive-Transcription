@@ -655,7 +655,7 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
         from audio_understanding.audio_encoders.piano_transcription_crnn import PianoTranscriptionCRnn
 
         random_init = configs["audio_encoder"].get("random_init", False)
-        model = PianoTranscriptionCRnn(sr=sr, trainable=trainable, random=random_init)
+        model = PianoTranscriptionCRnn(sr=sr, trainable=trainable)
 
     elif name == "PannsCnn14":
         from audio_understanding.audio_encoders.panns import PannsCnn14

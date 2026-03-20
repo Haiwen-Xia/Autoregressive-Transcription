@@ -4,9 +4,7 @@ clip_duration: 5.
 max_question_len: 50
 max_answering_len: 1000
 fps: 100
-output_root: "./maestro"
 run_name: null
-
 train_datasets:
     MAESTRO:
         root: "./datasets/maestro-v3.0.0"
@@ -40,8 +38,8 @@ llm:
     n_embd: 768
     
 train:
-    device: "cuda:1"
-    num_workers: 12
+    device: "cuda"
+    num_workers: 16
     remove_padded_columns: True
     loss: ce_loss
     optimizer: AdamW
