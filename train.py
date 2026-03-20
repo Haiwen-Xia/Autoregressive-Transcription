@@ -488,7 +488,7 @@ def ce_loss(
             total_loss += F.cross_entropy(
                 input=output_seqs[i].flatten(0, 1),  # shape: (b*t, vocab_size)
                 target=target_seqs[i].flatten(0, 1),  # shape: (b*t,)
-                ignore_index=-1
+                ignore_index=ignore_index
             )
 
         else:
