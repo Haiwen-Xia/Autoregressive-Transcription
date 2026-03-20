@@ -103,10 +103,47 @@ class PianoTranscriptionCRnn(nn.Module): #! 精度
 
         # Forward
         with torch.set_grad_enabled(self.trainable and train_mode):
-            latent = self._encode_before_post_fn(audio)  # shape: (b, t, d)
+            output_dict = self.model(audio)
 
-        assert latent.shape[-1] == self.latent_dim, (
-            f"Unexpected latent dim: {latent.shape[-1]} != {self.latent_dim}"
-        )
+        latent = torch.cat((
+            output_dict["reg_onset_output"], 
+            output_dict["reg_offset_output"], 
+            output_dict["frame_output"], 
+            output_dict["velocity_output"]
+        ), dim=-1)  # shape: (b, t, d)
 
-        return latent
+        return latent    
+    # def encode(self, audio: torch.Tensor, train_mode) -> torch.Tensor:
+    #     r"""Extract audio latent.
+
+    #     Args:
+    #         audio: (b, c, t)
+
+    #     Returns:
+    #         latent: (b, t, d)
+    #     """
+
+    #     # Resample audio
+    #     audio = torchaudio.functional.resample(
+    #         waveform=audio, 
+    #         orig_freq=self.audio_sr, 
+    #         new_freq=self.model_sr
+    #     )
+
+    #     # To mono
+    #     audio = torch.mean(audio, dim=1)  # shape: (b, t)
+
+    #     if self.trainable and train_mode:
+    #         self.model.train()
+    #     else:
+    #         self.model.eval()
+
+    #     # Forward
+    #     with torch.set_grad_enabled(self.trainable and train_mode):
+    #         latent = self._encode_before_post_fn(audio)  # shape: (b, t, d)
+
+    #     assert latent.shape[-1] == self.latent_dim, (
+    #         f"Unexpected latent dim: {latent.shape[-1]} != {self.latent_dim}"
+    #     )
+
+    #     return latent

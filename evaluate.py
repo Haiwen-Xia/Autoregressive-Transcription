@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any, cast
 import logging
 
+import librosa
+import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -45,6 +47,11 @@ VOCAB_PREFIX_KEYS = [
     "velocity",
     "program",
 ]
+
+DATASET_DEMO_AUDIO_PATHS = {
+    "MAESTRO": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/assets/audios/cut_liszt_5s.mp3",
+    "Slakh2100": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/assets/audios/duo.mp3",
+}
 
 
 def _token_prefix(token: str, prev_token: str = "") -> str:
@@ -688,6 +695,138 @@ def _collect_transcription_sample_previews(
     return previews
 
 
+def _to_mono_wave(audio: Any) -> torch.Tensor:
+    if not isinstance(audio, torch.Tensor):
+        audio = torch.as_tensor(audio)
+    if audio.ndim == 1:
+        return audio.to(dtype=torch.float32)
+    assert audio.ndim == 2, f"Expected audio with shape (c, t) or (t,), got {tuple(audio.shape)}"
+    return audio[0].to(dtype=torch.float32)
+
+
+def _export_eval_sample_target(
+    dataset: Any,
+    dataset_name: str,
+    audio_encoder: nn.Module,
+    llm: nn.Module,
+    tokenizer: Any,
+    configs: dict,
+    device: str,
+    output_dir: Path,
+) -> dict:
+    from inference_transcription import transcribe_audio
+
+    assert len(dataset) > 0, "Eval dataset is empty, cannot export eval sample target."
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    data = dataset[0]
+    mono = _to_mono_wave(data["audio"])  # (t,)
+    wav_path = output_dir / f"{dataset_name.lower()}_eval_sample.wav"
+    sf.write(file=str(wav_path), data=mono.detach().cpu().numpy(), samplerate=int(configs["sample_rate"]))
+
+    question = data.get("question", "Music transcription.")
+    audio_tensor = mono.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, t)
+    midi_path = output_dir / f"{dataset_name.lower()}_eval_sample_pred.mid"
+    pred = transcribe_audio(
+        audio_encoder=audio_encoder,
+        llm=llm,
+        tokenizer=tokenizer,
+        audio_tensor=audio_tensor,
+        configs=configs,
+        output_midi_path=str(midi_path),
+        question=question,
+        temperature=1.0,
+        top_k=1,
+    )
+
+    return {
+        "type": "eval_sample",
+        "dataset": dataset_name,
+        "sample_index": 0,
+        "question": question,
+        "source_audio_path": data.get("audio_path", ""),
+        "source_midi_path": data.get("midi_path", ""),
+        "saved_wav_path": str(wav_path),
+        "pred_midi_path": str(pred["midi_path"]),
+        "pred_token_count": int(len(pred["tokens"])),
+    }
+
+
+def _export_dataset_demo_audio_target(
+    dataset_name: str,
+    audio_encoder: nn.Module,
+    llm: nn.Module,
+    tokenizer: Any,
+    configs: dict,
+    device: str,
+    output_dir: Path,
+) -> dict:
+    from inference_transcription import transcribe_audio
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    assert dataset_name in DATASET_DEMO_AUDIO_PATHS, f"No demo audio configured for dataset: {dataset_name}"
+
+    demo_audio_path = Path(DATASET_DEMO_AUDIO_PATHS[dataset_name])
+    assert demo_audio_path.exists(), f"Configured demo audio does not exist: {demo_audio_path}"
+    audio, _ = librosa.load(path=str(demo_audio_path), sr=int(configs["sample_rate"]), mono=True)
+    mono = torch.as_tensor(audio, dtype=torch.float32)
+    audio_tensor = mono.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, t)
+
+    midi_path = output_dir / f"{dataset_name.lower()}_demo_audio_pred.mid"
+    pred = transcribe_audio(
+        audio_encoder=audio_encoder,
+        llm=llm,
+        tokenizer=tokenizer,
+        audio_tensor=audio_tensor,
+        configs=configs,
+        output_midi_path=str(midi_path),
+        question="Music transcription.",
+        temperature=1.0,
+        top_k=1,
+    )
+
+    return {
+        "type": "dataset_demo_audio",
+        "dataset": dataset_name,
+        "source_audio_path": str(demo_audio_path),
+        "pred_midi_path": str(pred["midi_path"]),
+        "pred_token_count": int(len(pred["tokens"])),
+    }
+
+
+def collect_output_targets(
+    dataset: Any,
+    dataset_name: str,
+    audio_encoder: nn.Module,
+    llm: nn.Module,
+    tokenizer: Any,
+    configs: dict,
+    device: str,
+    eval_dir: Path,
+) -> list[dict]:
+    output_dir = eval_dir / "output_targets"
+    sample_target = _export_eval_sample_target(
+        dataset=dataset,
+        dataset_name=dataset_name,
+        audio_encoder=audio_encoder,
+        llm=llm,
+        tokenizer=tokenizer,
+        configs=configs,
+        device=device,
+        output_dir=output_dir,
+    )
+    demo_target = _export_dataset_demo_audio_target(
+        dataset_name=dataset_name,
+        audio_encoder=audio_encoder,
+        llm=llm,
+        tokenizer=tokenizer,
+        configs=configs,
+        device=device,
+        output_dir=output_dir,
+    )
+    return [sample_target, demo_target]
+
+
 def _select_global_metrics_only(metrics: Any) -> Any:
     if isinstance(metrics, dict):
         selected = {}
@@ -1051,9 +1190,23 @@ def main_func(args: argparse.Namespace) -> None:
         eval_metrics["teacher_forced_ce"] = ce_summary
         additional_info["teacher_forced_details"] = ce_details
 
+        output_targets = collect_output_targets(
+            dataset=dataset,
+            dataset_name=dataset_name,
+            audio_encoder=audio_encoder,
+            llm=llm,
+            tokenizer=tokenizer,
+            configs=configs,
+            device=device,
+            eval_dir=eval_dir,
+        )
+        additional_info["output_targets"] = output_targets
+
         print("\n=== Evaluation Results ===")
         print(json.dumps(results, indent=2, default=str))
         print(f"Mean CE: {ce_summary['mean_ce']:.6f}")
+        print("Output targets:")
+        print(json.dumps(output_targets, indent=2, default=str))
 
     else:
         text_results, ce_summary, ce_details = run_text_evaluation(
