@@ -1,7 +1,7 @@
 """Music transcription inference with constrained decoding.
 
 Constrained decoding enforces the MIDI token grammar (MIDI2Tokens construction order):
-    name -> time_index -> pitch -> velocity (onset only) -> program (optional)
+    time_index -> name -> pitch -> velocity (onset only) -> program (optional)
 and tracks how many top-k candidates violate the grammar at each step.
 
 Usage:
@@ -205,6 +205,9 @@ def tokens_to_midi(
             i += 1
             continue
 
+        if not value.isdigit():
+            i += 1
+            continue
         time_index = int(value)
         if i + 1 >= n:
             break
@@ -224,20 +227,26 @@ def tokens_to_midi(
             k, v = tokens[j].split("=", 1)
             if k == "time_index":
                 break
+            if tokens[j] in ["name=note_onset", "name=note_offset"]:
+                break
 
-            if k in ["pitch", "drum_pitch", "velocity", "program", "name"]:
+            if k in ["pitch", "drum_pitch", "velocity", "program"]:
                 event[k] = v
             j += 1
 
         is_onset = name_tok == "name=note_onset"
         pitch_key = "drum_pitch" if "drum_pitch" in event else "pitch"
-        assert pitch_key in event
+        if pitch_key not in event:
+            i = j
+            continue
         pitch = int(event[pitch_key])
         program = int(event["program"]) if "program" in event else (128 if pitch_key == "drum_pitch" else 0)
         key_pitch_program = (pitch, program)
 
         if is_onset:
-            assert "velocity" in event
+            if "velocity" not in event:
+                i = j
+                continue
             velocity = int(event["velocity"])
             note = {
                 "onset_time_index": time_index,
