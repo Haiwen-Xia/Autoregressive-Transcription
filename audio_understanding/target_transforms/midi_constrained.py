@@ -1,7 +1,7 @@
 """Constrained decoder for MIDI token generation.
 
 Enforces token generation order per event (matching MIDI2Tokens construction order):
-    name -> time_index -> pitch -> velocity (onset only) -> program (optional)
+    time_index -> name -> pitch -> velocity (onset only) -> program (optional)
 
 Tracks violations: how many top-k candidates fall outside the allowed set at each step.
 """
@@ -12,12 +12,12 @@ import torch
 class MidiConstrainedDecoder:
 
     # States
-    EXPECT_NAME_OR_SEP = 0  # start of a new event, or [SEP] to end
-    EXPECT_TIME = 1
+    EXPECT_TIME_OR_SEP = 0  # start of a new event, or [SEP] to end
+    EXPECT_NAME = 1
     EXPECT_PITCH = 2
     EXPECT_VELOCITY = 3
     EXPECT_PROGRAM = 4
-    STATE_NAMES = ["EXPECT_NAME_OR_SEP", "EXPECT_TIME", "EXPECT_PITCH", "EXPECT_VELOCITY", "EXPECT_PROGRAM"]
+    STATE_NAMES = ["EXPECT_TIME_OR_SEP", "EXPECT_NAME", "EXPECT_PITCH", "EXPECT_VELOCITY", "EXPECT_PROGRAM"]
 
     def __init__(self, tokenizer, vocab_size: int, include_program: bool = False, device: str = "cuda"):
         """
@@ -39,14 +39,14 @@ class MidiConstrainedDecoder:
         # Precompute allowed-ID boolean masks for each state, shape: (5, vocab_size)
         self.masks = torch.zeros(5, vocab_size, dtype=torch.bool, device=device)
 
-        # EXPECT_NAME_OR_SEP: note_onset / note_offset / [SEP]
-        self.masks[self.EXPECT_NAME_OR_SEP, self.name_onset_id] = True
-        self.masks[self.EXPECT_NAME_OR_SEP, self.name_offset_id] = True
-        self.masks[self.EXPECT_NAME_OR_SEP, self.sep_id] = True
-
-        # EXPECT_TIME: time_index=0..6000
+        # EXPECT_TIME_OR_SEP: time_index=0..6000 or [SEP]
         time_start = tok.convert_tokens_to_ids("time_index=0")
-        self.masks[self.EXPECT_TIME, time_start : time_start + 6001] = True
+        self.masks[self.EXPECT_TIME_OR_SEP, time_start : time_start + 6001] = True
+        self.masks[self.EXPECT_TIME_OR_SEP, self.sep_id] = True
+
+        # EXPECT_NAME: note_onset / note_offset
+        self.masks[self.EXPECT_NAME, self.name_onset_id] = True
+        self.masks[self.EXPECT_NAME, self.name_offset_id] = True
 
         # EXPECT_PITCH: pitch=0..127 plus optional drum_pitch=0..127
         pitch_start = tok.convert_tokens_to_ids("pitch=0")
@@ -64,7 +64,7 @@ class MidiConstrainedDecoder:
         self.masks[self.EXPECT_PROGRAM, prog_start : prog_start + 129] = True
 
         # Runtime state
-        self.state = self.EXPECT_NAME_OR_SEP
+        self.state = self.EXPECT_TIME_OR_SEP
         self.current_name_id = None
         self.violations = 0
         self.total_topk_candidates = 0
@@ -93,14 +93,14 @@ class MidiConstrainedDecoder:
             True  -> keep generating
             False -> stop (SEP was generated)
         """
-        if self.state == self.EXPECT_NAME_OR_SEP:
+        if self.state == self.EXPECT_TIME_OR_SEP:
             if token_id == self.sep_id:
                 return False  # end of sequence
+            self.state = self.EXPECT_NAME
+
+        elif self.state == self.EXPECT_NAME:
             # got name=note_onset or name=note_offset
             self.current_name_id = token_id
-            self.state = self.EXPECT_TIME
-
-        elif self.state == self.EXPECT_TIME:
             self.state = self.EXPECT_PITCH
 
         elif self.state == self.EXPECT_PITCH:
@@ -111,21 +111,21 @@ class MidiConstrainedDecoder:
                 if self.include_program:
                     self.state = self.EXPECT_PROGRAM
                 else:
-                    self.state = self.EXPECT_NAME_OR_SEP
+                    self.state = self.EXPECT_TIME_OR_SEP
 
         elif self.state == self.EXPECT_VELOCITY:
             if self.include_program:
                 self.state = self.EXPECT_PROGRAM
             else:
-                self.state = self.EXPECT_NAME_OR_SEP
+                self.state = self.EXPECT_TIME_OR_SEP
 
         elif self.state == self.EXPECT_PROGRAM:
-            self.state = self.EXPECT_NAME_OR_SEP
+            self.state = self.EXPECT_TIME_OR_SEP
 
         return True
 
     def reset(self) -> None:
-        self.state = self.EXPECT_NAME_OR_SEP
+        self.state = self.EXPECT_TIME_OR_SEP
         self.current_name_id = None
         self.violations = 0
         self.total_topk_candidates = 0

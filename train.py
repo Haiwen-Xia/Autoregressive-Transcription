@@ -962,8 +962,16 @@ def get_llm(
 
         time_rope_cfg = configs["llm"].get("time_aware_rope", {})
         time_aware_rope = bool(time_rope_cfg.get("enable", False))
-        time_rope_mix_weight = float(time_rope_cfg.get("mix_weight", 0.5))
         time_rope_use_linear = bool(time_rope_cfg.get("use_linear", False))
+        time_rope_mix_weight = float(time_rope_cfg.get("mix_weight", 0.5))
+        if time_aware_rope:
+            rope_mode = str(time_rope_cfg.get("mode", "1d"))
+            if rope_mode == "time_aware":
+                rope_mode = "1d_linear" if time_rope_use_linear else "1d"
+            elif rope_mode == "time_aware_2d":
+                rope_mode = "2d"
+        else:
+            rope_mode = "ordinary"
         time_rope_audio_fps = get_fps(audio_encoder, module_name="audio_encoder")
         time_rope_token_fps = float(configs["fps"])
         time_rope_alpha_cfg = time_rope_cfg.get("alpha")
@@ -1004,7 +1012,7 @@ def get_llm(
             n_embd=n_embd,
             audio_use_absolute_pe=audio_use_absolute_pe,
             rope_scope=rope_scope,
-            time_aware_rope=time_aware_rope,
+            rope_mode=rope_mode,
             time_rope_mix_weight=time_rope_mix_weight,
             time_rope_use_linear=time_rope_use_linear,
             time_rope_audio_fps=time_rope_audio_fps,

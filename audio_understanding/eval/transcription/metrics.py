@@ -13,8 +13,8 @@ Token format (as produced by MIDI2Tokens)
 Events are represented as a flat list of strings.  Each note event occupies
 consecutive tokens in the following order::
 
-    note_onset:  name=note_onset  time_index=X  pitch=X  velocity=X  [program=X]
-    note_offset: name=note_offset time_index=X  pitch=X              [program=X]
+    note_onset:  time_index=X  name=note_onset  pitch=X  velocity=X  [program=X]
+    note_offset: time_index=X  name=note_offset pitch=X              [program=X]
 
 Time in seconds = time_index / fps.
 
@@ -57,12 +57,12 @@ def parse_tokens_to_notes(
 ) -> list[dict]:
     r"""Parse a MIDI token sequence into a list of note event dicts.
 
-    Token order per event (matching MIDI2Tokens construction order):
+        Token order per event (matching MIDI2Tokens construction order):
 
-        * note_onset:  ``name=note_onset``, ``time_index=X``, ``pitch=X`` or ``drum_pitch=X``,
-      ``velocity=X`` [, ``program=X``]
-        * note_offset: ``name=note_offset``, ``time_index=X``, ``pitch=X`` or ``drum_pitch=X``
-      [, ``program=X``]
+                * note_onset:  ``time_index=X``, ``name=note_onset``, ``pitch=X`` or ``drum_pitch=X``,
+            ``velocity=X`` [, ``program=X``]
+                * note_offset: ``time_index=X``, ``name=note_offset``, ``pitch=X`` or ``drum_pitch=X``
+            [, ``program=X``]
 
     Args:
         tokens: flat list of token strings as produced by the model.
@@ -99,95 +99,176 @@ def parse_tokens_to_notes(
 
         key, value = tok.split("=", 1)
 
-        if key == "name" and value == "note_onset":
-            event_len = 4 + (1 if include_program else 0)
-            if i + event_len > n:
+        # Preferred format: time_index-first event.
+        if key == "time_index":
+            time_index = int(value)
+            if i + 1 >= n:
                 break
-            try:
-                time_index = int(tokens[i + 1].split("=")[1])
-                pitch_key, pitch_value = tokens[i + 2].split("=", 1)
-                assert pitch_key in ["pitch", "drum_pitch"]
-                pitch = int(pitch_value)
-                velocity = int(tokens[i + 3].split("=")[1])
-            except (ValueError, IndexError):
+
+            name_tok = tokens[i + 1]
+            if name_tok not in ["name=note_onset", "name=note_offset"]:
                 i += 1
                 continue
-            note: dict = {
-                "onset_time": start_time + time_index / fps,
-                "offset_time": None,
-                "pitch": pitch,
-                "velocity": velocity,
-            }
-            if include_program:
-                try:
-                    note["program"] = int(tokens[i + 4].split("=")[1])
-                except (ValueError, IndexError):
-                    note["program"] = 0
-            elif pitch_key == "drum_pitch":
-                note["program"] = DRUM_PROGRAM
-                note["is_drum"] = True
-            open_key: object = pitch
-            if include_program:
-                open_key = (pitch, int(note["program"]))
-            open_notes.setdefault(open_key, []).append(note)
-            i += event_len
+
+            j = i + 2
+            event: dict[str, str] = {}
+            while j < n:
+                if "=" not in tokens[j]:
+                    break
+                k, v = tokens[j].split("=", 1)
+                if k == "time_index":
+                    break
+                if tokens[j] in ["name=note_onset", "name=note_offset"]:
+                    break
+                if k in ["pitch", "drum_pitch", "velocity", "program"]:
+                    event[k] = v
+                j += 1
+
+            pitch_key = "drum_pitch" if "drum_pitch" in event else "pitch"
+            if pitch_key not in event:
+                i = j
+                continue
+            pitch = int(event[pitch_key])
+
+            is_onset = name_tok == "name=note_onset"
+            if is_onset:
+                if "velocity" not in event:
+                    i = j
+                    continue
+                velocity = int(event["velocity"])
+
+                note: dict = {
+                    "onset_time": start_time + time_index / fps,
+                    "offset_time": None,
+                    "pitch": pitch,
+                    "velocity": velocity,
+                }
+                if include_program:
+                    note["program"] = int(event["program"]) if "program" in event else 0
+                elif pitch_key == "drum_pitch":
+                    note["program"] = DRUM_PROGRAM
+                    note["is_drum"] = True
+
+                open_key: object = pitch
+                if include_program:
+                    open_key = (pitch, int(note["program"]))
+                elif pitch_key == "drum_pitch":
+                    open_key = (pitch, DRUM_PROGRAM)
+                open_notes.setdefault(open_key, []).append(note)
+
+            else:
+                close_key: object = pitch
+                close_program = 0
+                if include_program:
+                    close_program = int(event["program"]) if "program" in event else 0
+                    close_key = (pitch, close_program)
+                elif pitch_key == "drum_pitch":
+                    close_key = (pitch, DRUM_PROGRAM)
+
+                if open_notes.get(close_key):
+                    # Match offset to the earliest unmatched same-pitch onset (queue/FIFO).
+                    # FIFO is correct for sequential overlapping notes (common in
+                    # piano with sustain pedal): onset_A, onset_B, offset_A, offset_B.
+                    note = open_notes[close_key].pop(0)
+                    off_time = start_time + time_index / fps
+                    #! clip only Ensure strictly positive duration (mirrors MIDI2Tokens bump)
+                    if off_time <= note["onset_time"]:
+                        off_time = note["onset_time"] + 1.0 / fps
+                    note["offset_time"] = off_time
+                    finished.append(note)
+                else:
+                    # Handle left-clipped notes represented by offset-only events.
+                    # MIDI2Tokens can emit note_offset without note_onset when
+                    # note.start < clip_start <= note.end.
+                    if not exclude_boundary:
+                        off_time = start_time + time_index / fps
+                        #! clip only Skip if offset lands on clip start (zero-duration)
+                        if off_time <= start_time:
+                            i = j
+                            continue
+                        note = {
+                            "onset_time": start_time,
+                            "offset_time": off_time,
+                            "pitch": pitch,
+                            "velocity": 0,
+                        }
+                        if include_program:
+                            note["program"] = int(close_program)
+                        elif pitch_key == "drum_pitch":
+                            note["program"] = DRUM_PROGRAM
+                            note["is_drum"] = True
+                        finished.append(note)
+
+            i = j
             continue
 
-        elif key == "name" and value == "note_offset":
-            event_len = 3 + (1 if include_program else 0)
+        # Backward compatibility: legacy name-first event.
+        if key == "name" and value in ["note_onset", "note_offset"]:
+            is_onset = value == "note_onset"
+            event_len = (4 if is_onset else 3) + (1 if include_program else 0)
             if i + event_len > n:
                 break
-            try:
-                time_index = int(tokens[i + 1].split("=")[1])
-                pitch_key, pitch_value = tokens[i + 2].split("=", 1)
-                assert pitch_key in ["pitch", "drum_pitch"]
-                pitch = int(pitch_value)
-            except (ValueError, IndexError):
-                i += 1
-                continue
-            close_key: object = pitch
-            if include_program:
-                try:
-                    close_program = int(tokens[i + 3].split("=")[1])
-                except (ValueError, IndexError):
-                    close_program = 0
-                close_key = (pitch, close_program)
-            elif pitch_key == "drum_pitch":
-                close_key = (pitch, DRUM_PROGRAM)
+            legacy_tokens = tokens[i : i + event_len]
 
-            if open_notes.get(close_key):
-                # Match offset to the earliest unmatched same-pitch onset (queue/FIFO).
-                # FIFO is correct for sequential overlapping notes (common in
-                # piano with sustain pedal): onset_A, onset_B, offset_A, offset_B.
-                note = open_notes[close_key].pop(0)
-                off_time = start_time + time_index / fps
-                #! clip only Ensure strictly positive duration (mirrors MIDI2Tokens bump)
-                if off_time <= note["onset_time"]:
-                    off_time = note["onset_time"] + 1.0 / fps
-                note["offset_time"] = off_time
-                finished.append(note)
+            time_index = int(legacy_tokens[1].split("=", 1)[1])
+            pitch_key, pitch_value = legacy_tokens[2].split("=", 1)
+            assert pitch_key in ["pitch", "drum_pitch"]
+            pitch = int(pitch_value)
+
+            if is_onset:
+                velocity = int(legacy_tokens[3].split("=", 1)[1])
+                note: dict = {
+                    "onset_time": start_time + time_index / fps,
+                    "offset_time": None,
+                    "pitch": pitch,
+                    "velocity": velocity,
+                }
+                if include_program:
+                    note["program"] = int(legacy_tokens[4].split("=", 1)[1]) if event_len == 5 else 0
+                elif pitch_key == "drum_pitch":
+                    note["program"] = DRUM_PROGRAM
+                    note["is_drum"] = True
+
+                open_key: object = pitch
+                if include_program:
+                    open_key = (pitch, int(note["program"]))
+                elif pitch_key == "drum_pitch":
+                    open_key = (pitch, DRUM_PROGRAM)
+                open_notes.setdefault(open_key, []).append(note)
+
             else:
-                # Handle left-clipped notes represented by offset-only events.
-                # MIDI2Tokens can emit note_offset without note_onset when
-                # note.start < clip_start <= note.end.
-                if not exclude_boundary:
+                close_key: object = pitch
+                close_program = 0
+                if include_program:
+                    close_program = int(legacy_tokens[3].split("=", 1)[1]) if event_len == 4 else 0
+                    close_key = (pitch, close_program)
+                elif pitch_key == "drum_pitch":
+                    close_key = (pitch, DRUM_PROGRAM)
+
+                if open_notes.get(close_key):
+                    note = open_notes[close_key].pop(0)
                     off_time = start_time + time_index / fps
-                    #! clip only Skip if offset lands on clip start (zero-duration)
-                    if off_time <= start_time:
-                        i += event_len
-                        continue
-                    note = {
-                        "onset_time": start_time,
-                        "offset_time": off_time,
-                        "pitch": pitch,
-                        "velocity": 0,
-                    }
-                    if include_program:
-                        note["program"] = int(close_program)
-                    elif pitch_key == "drum_pitch":
-                        note["program"] = DRUM_PROGRAM
-                        note["is_drum"] = True
+                    if off_time <= note["onset_time"]:
+                        off_time = note["onset_time"] + 1.0 / fps
+                    note["offset_time"] = off_time
                     finished.append(note)
+                else:
+                    if not exclude_boundary:
+                        off_time = start_time + time_index / fps
+                        if off_time > start_time:
+                            note = {
+                                "onset_time": start_time,
+                                "offset_time": off_time,
+                                "pitch": pitch,
+                                "velocity": 0,
+                            }
+                            if include_program:
+                                note["program"] = int(close_program)
+                            elif pitch_key == "drum_pitch":
+                                note["program"] = DRUM_PROGRAM
+                                note["is_drum"] = True
+                            finished.append(note)
+
             i += event_len
             continue
 

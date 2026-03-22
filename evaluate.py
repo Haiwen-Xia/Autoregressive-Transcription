@@ -38,9 +38,9 @@ from train import get_audio_encoder, get_llm, get_tokenizer
 
 
 VOCAB_PREFIX_KEYS = [
-    "time_index_after_note_onset",
-    "time_index_after_note_offset",
-    "time_index_other",
+    "time_index",
+    "name_after_time_index",
+    "name_other",
     "name",
     "pitch",
     "drum_pitch",
@@ -59,12 +59,10 @@ def _token_prefix(token: str, prev_token: str = "") -> str:
         return "special"
     if "=" in token:
         prefix = token.split("=", 1)[0]
-        if prefix == "time_index":
-            if prev_token in ("name=note_onset", "name=note_on"):
-                return "time_index_after_note_onset"
-            if prev_token in ("name=note_offset", "name=note_off"):
-                return "time_index_after_note_offset"
-            return "time_index_other"
+        if prefix == "name":
+            if prev_token.startswith("time_index="):
+                return "name_after_time_index"
+            return "name_other"
         return prefix
     return "text"
 
