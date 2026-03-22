@@ -129,7 +129,7 @@ def transcribe_audio(
 def format_tokens_by_event(tokens: list[str], include_program: bool = False) -> str:
     """Pretty-print token list, one line per event.
 
-    Token order: name, time_index, pitch, (velocity), (program)
+    Token order: time_index, name, pitch, (velocity), (program)
     onset event len = 4 + program, offset event len = 3 + program
     """
     lines = []
@@ -143,22 +143,34 @@ def format_tokens_by_event(tokens: list[str], include_program: bool = False) -> 
             event_idx += 1
             continue
 
-        key, value = tok.split("=")
-        if key == "name":
-            # Determine event length
-            if value == "note_onset":
-                event_len = 4 + (1 if include_program else 0)
-            else:
-                event_len = 3 + (1 if include_program else 0)
-
-            chunk = tokens[i : i + event_len]
-            lines.append(f"  [{event_idx}] " + " | ".join(chunk))
-            i += event_len
+        key, _ = tok.split("=", 1)
+        if key != "time_index":
+            lines.append(f"  [{event_idx}] {tok}")
+            i += 1
             event_idx += 1
+            continue
+
+        if i + 1 >= len(tokens):
+            lines.append(f"  [{event_idx}] {tok}")
+            i += 1
+            event_idx += 1
+            continue
+
+        name_tok = tokens[i + 1]
+        if name_tok == "name=note_onset":
+            event_len = 4 + (1 if include_program else 0)
+        elif name_tok == "name=note_offset":
+            event_len = 3 + (1 if include_program else 0)
         else:
             lines.append(f"  [{event_idx}] {tok}")
             i += 1
             event_idx += 1
+            continue
+
+        chunk = tokens[i : i + event_len]
+        lines.append(f"  [{event_idx}] " + " | ".join(chunk))
+        i += event_len
+        event_idx += 1
 
     return "\n".join(lines)
 
@@ -175,8 +187,8 @@ def tokens_to_midi(
     """Convert generated token list to a MIDI file.
 
     Expected token order per event (MIDI2Tokens construction order):
-        note_onset:  name=note_onset, time_index=X, (pitch|drum_pitch)=X, velocity=X [, program=X]
-        note_offset: name=note_offset, time_index=X, (pitch|drum_pitch)=X [, program=X]
+        note_onset:  time_index=X, name=note_onset, (pitch|drum_pitch)=X, velocity=X [, program=X]
+        note_offset: time_index=X, name=note_offset, (pitch|drum_pitch)=X [, program=X]
     """
     note_dict: dict[tuple[int, int], list[dict]] = {}
     n = len(tokens)
@@ -188,56 +200,59 @@ def tokens_to_midi(
             i += 1
             continue
 
-        key, value = tok.split("=")
+        key, value = tok.split("=", 1)
+        if key != "time_index":
+            i += 1
+            continue
 
-        if key == "name" and value == "note_onset":
-            # name, time_index, pitch, velocity, (program)
-            event_len = 4 + (1 if include_program else 0)
-            if i + event_len > n:
+        time_index = int(value)
+        if i + 1 >= n:
+            break
+
+        name_tok = tokens[i + 1]
+        if name_tok not in ["name=note_onset", "name=note_offset"]:
+            i += 1
+            continue
+
+        j = i + 2
+        event: dict[str, int | str] = {"time_index": time_index}
+
+        while j < n:
+            if "=" not in tokens[j]:
                 break
-            time_index = int(tokens[i + 1].split("=")[1])
-            pitch_key, pitch_value = tokens[i + 2].split("=", 1)
-            pitch = int(pitch_value)
-            velocity = int(tokens[i + 3].split("=")[1])
-            program = 0
-            if include_program:
-                program = int(tokens[i + 4].split("=")[1])
-            elif pitch_key == "drum_pitch":
-                program = 128
+
+            k, v = tokens[j].split("=", 1)
+            if k == "time_index":
+                break
+
+            if k in ["pitch", "drum_pitch", "velocity", "program", "name"]:
+                event[k] = v
+            j += 1
+
+        is_onset = name_tok == "name=note_onset"
+        pitch_key = "drum_pitch" if "drum_pitch" in event else "pitch"
+        assert pitch_key in event
+        pitch = int(event[pitch_key])
+        program = int(event["program"]) if "program" in event else (128 if pitch_key == "drum_pitch" else 0)
+        key_pitch_program = (pitch, program)
+
+        if is_onset:
+            assert "velocity" in event
+            velocity = int(event["velocity"])
             note = {
                 "onset_time_index": time_index,
                 "pitch": pitch,
                 "velocity": velocity,
                 "program": program,
             }
-            key_pitch_program = (pitch, program)
             if key_pitch_program not in note_dict:
                 note_dict[key_pitch_program] = []
             note_dict[key_pitch_program].append(note)
-            i += event_len
-            continue
-
-        elif key == "name" and value == "note_offset":
-            # name, time_index, pitch, (program)
-            event_len = 3 + (1 if include_program else 0)
-            if i + event_len > n:
-                break
-            time_index = int(tokens[i + 1].split("=")[1])
-            pitch_key, pitch_value = tokens[i + 2].split("=", 1)
-            pitch = int(pitch_value)
-            program = 0
-            if include_program:
-                program = int(tokens[i + 3].split("=")[1])
-            elif pitch_key == "drum_pitch":
-                program = 128
-            key_pitch_program = (pitch, program)
-
+        else:
             if key_pitch_program in note_dict and len(note_dict[key_pitch_program]) > 0:
                 note_dict[key_pitch_program][-1]["offset_time_index"] = time_index
-            i += event_len
-            continue
 
-        i += 1
+        i = j
 
     # Collect all notes
     midi_data = pretty_midi.PrettyMIDI()
@@ -256,6 +271,8 @@ def tokens_to_midi(
 
                 start_time = e["onset_time_index"] / fps
                 end_time = e.get("offset_time_index", e["onset_time_index"] + int(fps * 0.1)) / fps
+                assert 0 <= int(e["pitch"]) <= 127
+                assert 0 <= int(e["velocity"]) <= 127
                 note = pretty_midi.Note(
                     pitch=e["pitch"],
                     start=start_time,
@@ -274,6 +291,8 @@ def tokens_to_midi(
             for e in events:
                 start_time = e["onset_time_index"] / fps
                 end_time = e.get("offset_time_index", e["onset_time_index"] + int(fps * 0.1)) / fps
+                assert 0 <= int(e["pitch"]) <= 127
+                assert 0 <= int(e["velocity"]) <= 127
                 note = pretty_midi.Note(
                     pitch=e["pitch"],
                     start=start_time,
@@ -307,6 +326,8 @@ def main_func(args) -> None:
         audio_latent_dim=audio_encoder.latent_dim,
         vocab_size=len(tokenizer),
         ckpt_path=args.ckpt_path,
+        audio_encoder=audio_encoder,
+        tokenizer=tokenizer,
     ).to(device)
 
     # Load audio segment

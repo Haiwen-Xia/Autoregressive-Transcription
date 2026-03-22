@@ -41,7 +41,9 @@ def inference(args) -> None:
         configs=configs, 
         audio_latent_dim=audio_encoder.latent_dim, 
         vocab_size=len(tokenizer),
-        ckpt_path=ckpt_path
+        ckpt_path=ckpt_path,
+        audio_encoder=audio_encoder,
+        tokenizer=tokenizer,
     ).to(device)
 
     # Load the begining part of audio

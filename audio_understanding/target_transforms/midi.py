@@ -12,7 +12,7 @@ class MIDI2Tokens:
             data: dict
 
         Outputs:
-            tokens: list[str], e.g., ["name=note_onset", "time_index=15", "pitch=36", "velocity=27", ...]
+            tokens: list[str], e.g., ["time_index=15", "name=note_onset", "pitch=36", "velocity=27", ...]
         """
 
         start_time = data["start_time"]
@@ -47,8 +47,8 @@ class MIDI2Tokens:
             elif (note.start < start_time) and (start_time <= note.end <= end_time):
                 
                 events.append([
-                    "name=note_offset",
                     "time_index={}".format(round((note.end - start_time) * self.fps)),
+                    "name=note_offset",
                     "{}={}".format(pitch_token_key, note.pitch)
                 ] + program_token)
 
@@ -66,25 +66,25 @@ class MIDI2Tokens:
                 #! this only works on segment handling and should be removed in the future. Theoretically, zero-duration notes CAN BE detected.
                 if offset_idx <= onset_idx:
                     offset_idx = onset_idx + 1
-
+                #* time_index applied first
                 events.append([
+                    "time_index={}".format(onset_idx),                    
                     "name=note_onset",
-                    "time_index={}".format(onset_idx),
                     "{}={}".format(pitch_token_key, note.pitch),
                     "velocity={}".format(note.velocity)
                 ] + program_token)
 
                 events.append([
+                    "time_index={}".format(offset_idx),                    
                     "name=note_offset",
-                    "time_index={}".format(offset_idx),
                     "{}={}".format(pitch_token_key, note.pitch),
                 ] + program_token)
 
             elif (start_time <= note.start <= end_time) and (end_time < note.end):
 
                 events.append([
-                    "name=note_onset",
                     "time_index={}".format(round((note.start - start_time) * self.fps)),
+                    "name=note_onset",
                     "{}={}".format(pitch_token_key, note.pitch),
                     "velocity={}".format(note.velocity)
                 ] + program_token)
