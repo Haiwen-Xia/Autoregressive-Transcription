@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
 
 
 DEFAULT_EVENT_ATTRIBUTE_PREFIXES = (
-    "onset",
-    "offset",
     "duration",
     "pitch=",
     "drum_pitch=",
     "velocity=",
     "program=",
+    "name="
 )
 
 
@@ -58,19 +57,19 @@ def update_decode_state(
 
 
 def assign_time_coords(
-    item_types: list[str],
-    items: list[None | str],
-    audio_times: list[None | float],
+    item_types: Sequence[str],
+    items: Sequence[None | str],
+    audio_times: Sequence[None | float],
     audio_fps: float,
     token_fps: float,
     alpha: float,
     strict_event_time: bool = True,
-) -> tuple[list[int], list[float], list[bool]]:
+) -> tuple[list[int], list[float]]:
     pos_ids: list[int] = []
     time_coords: list[float] = []
-    use_time_rope: list[bool] = []
 
     current_event_time: None | float = None
+    max_time_coord = -1.0
 
     for i, item_type in enumerate(item_types):
         pos_ids.append(i)
@@ -78,35 +77,38 @@ def assign_time_coords(
         if item_type == "audio_latent":
             t = audio_times[i]
             assert t is not None
-            time_coords.append(float(alpha) * float(t))
-            use_time_rope.append(True)
+            coord = float(alpha) * float(t)
+            time_coords.append(coord)
+            max_time_coord = max(max_time_coord, coord)
 
         elif item_type == "timestamp":
             tok = items[i]
             assert tok is not None
             current_event_time = parse_time_token(tok, token_fps=token_fps)
-            time_coords.append(float(alpha) * float(current_event_time))
-            use_time_rope.append(True)
+            coord = float(alpha) * float(current_event_time)
+            time_coords.append(coord)
+            max_time_coord = max(max_time_coord, coord)
 
         elif item_type == "event_attribute":
             if strict_event_time:
                 assert current_event_time is not None, "Event attribute token seen before any timestamp token"
 
             if current_event_time is None:
-                time_coords.append(0.0)
-                use_time_rope.append(False)
+                coord = max_time_coord + 1.0
             else:
-                time_coords.append(float(alpha) * float(current_event_time))
-                use_time_rope.append(True)
+                coord = float(alpha) * float(current_event_time)
+            time_coords.append(coord)
+            max_time_coord = max(max_time_coord, coord)
 
         elif item_type == "non_temporal":
-            time_coords.append(0.0)
-            use_time_rope.append(False)
+            coord = max_time_coord + 1.0
+            time_coords.append(coord)
+            max_time_coord = coord
 
         else:
             raise ValueError(item_type)
 
-    return pos_ids, time_coords, use_time_rope
+    return pos_ids, time_coords
 
 
 def build_position_time_inputs(
@@ -118,7 +120,7 @@ def build_position_time_inputs(
     alpha: float,
     event_attribute_prefixes: tuple[str, ...] = DEFAULT_EVENT_ATTRIBUTE_PREFIXES,
     strict_event_time: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     assert len(seqs) == len(seq_types)
     assert audio_fps > 0
     assert token_fps > 0
@@ -129,7 +131,6 @@ def build_position_time_inputs(
 
     pos_ids = torch.arange(seq_len_total, device=seqs[0].device, dtype=torch.long)
     time_coords = torch.zeros((batch_size, seq_len_total), device=seqs[0].device, dtype=torch.float32)
-    use_time_rope = torch.zeros((batch_size, seq_len_total), device=seqs[0].device, dtype=torch.bool)
 
     for b in range(batch_size):
         item_types: list[str] = []
@@ -163,7 +164,7 @@ def build_position_time_inputs(
             else:
                 raise ValueError(seq_type)
 
-        _, tc, utr = assign_time_coords(
+        _, tc = assign_time_coords(
             item_types=item_types,
             items=items,
             audio_times=audio_times,
@@ -174,9 +175,8 @@ def build_position_time_inputs(
         )
 
         time_coords[b] = torch.tensor(tc, device=seqs[0].device, dtype=torch.float32)
-        use_time_rope[b] = torch.tensor(utr, device=seqs[0].device, dtype=torch.bool)
 
-    return pos_ids, time_coords, use_time_rope
+    return pos_ids, time_coords
 
 
 def infer_current_event_time_from_tokens(

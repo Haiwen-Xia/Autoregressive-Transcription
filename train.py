@@ -957,8 +957,6 @@ def get_llm(
         n_layer = configs["llm"]["n_layer"]
         n_head = configs["llm"]["n_head"]
         n_embd = configs["llm"]["n_embd"]
-        audio_use_absolute_pe = bool(configs["llm"].get("audio_use_absolute_pe", False))
-        rope_scope = str(configs["llm"].get("rope_scope", "all"))
 
         time_rope_cfg = configs["llm"].get("time_aware_rope", {})
         time_aware_rope = bool(time_rope_cfg.get("enable", False))
@@ -979,20 +977,6 @@ def get_llm(
             time_rope_alpha = float(time_rope_audio_fps)
         else:
             time_rope_alpha = float(time_rope_alpha_cfg)
-        time_rope_event_attribute_prefixes = tuple(
-            time_rope_cfg.get(
-                "event_attribute_prefixes",
-                [
-                    "onset",
-                    "offset",
-                    "duration",
-                    "pitch=",
-                    "drum_pitch=",
-                    "velocity=",
-                    "program=",
-                ],
-            )
-        )
 
         id_to_token = None
         if tokenizer is not None and hasattr(tokenizer, "tok"):
@@ -1010,15 +994,12 @@ def get_llm(
             n_layer=n_layer,
             n_head=n_head,
             n_embd=n_embd,
-            audio_use_absolute_pe=audio_use_absolute_pe,
-            rope_scope=rope_scope,
             rope_mode=rope_mode,
             time_rope_mix_weight=time_rope_mix_weight,
             time_rope_use_linear=time_rope_use_linear,
             time_rope_audio_fps=time_rope_audio_fps,
             time_rope_token_fps=time_rope_token_fps,
             time_rope_alpha=time_rope_alpha,
-            time_rope_event_attribute_prefixes=time_rope_event_attribute_prefixes,
             id_to_token=id_to_token,
         )
         model = Llama(config=config)
