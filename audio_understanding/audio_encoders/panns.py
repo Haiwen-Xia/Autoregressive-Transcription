@@ -22,6 +22,7 @@ class PannsCnn14(nn.Module):
         self.audio_sr = sr
         self.model_sr = 32000  # PANNs encoder sampling rate
         self.trainable = trainable
+        self.fps = 1.0
 
         self.model = AudioTagging(checkpoint_path=None, device="cpu").model
         self.latent_dim = 2048

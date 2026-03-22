@@ -43,6 +43,7 @@ class MERT(nn.Module):
         self.model_sr = self.feature_extractor.sampling_rate
         self.do_normalize = self.feature_extractor.do_normalize
         self.latent_dim = self.model.config.hidden_size
+        self.fps = 75.0
 
         self.target_layer = target_layer
         self.num_hidden_layers = len(self.model.encoder.layers)

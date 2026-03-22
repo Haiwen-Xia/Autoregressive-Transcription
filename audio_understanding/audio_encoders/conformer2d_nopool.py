@@ -77,6 +77,7 @@ class Conformer2D(Fourier):
         self.train_mode = trainable
         self.latent_dim = config.n_embd
         self.use_decoder = use_decoder
+        self.fps = 100.0
         
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -351,4 +352,4 @@ class MLP(nn.Module):
         """
         x = F.silu(self.c_fc1(x)) * self.c_fc2(x)
         x = self.c_proj(x)
-        return x
+        return x    

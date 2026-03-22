@@ -36,7 +36,7 @@ class MuQ(nn.Module):
         #* perhaps a better way is to just run a sample first
         self.latent_dim = 1024
         self.num_hidden_layers = 13
-        self.latent_fps = 25 
+        self.fps = 25.0
 
         self.target_layer = target_layer
         self._validate_target_layer()

@@ -33,6 +33,11 @@ class PianoTranscriptionCRnn(nn.Module): #! 精度
         else:
             self.model = PianoTranscription(device="cpu", checkpoint_path=None).model
         self.latent_dim = 88 * 4
+        self._fps = 100.0
+
+    @property
+    def fps(self) -> float:
+        return self._fps
 
     def _encode_before_post_fn(self, audio: torch.Tensor) -> torch.Tensor:
         """Extract note logits before post-fn refinement in piano_transcription_inference."""
@@ -147,3 +152,10 @@ class PianoTranscriptionCRnn(nn.Module): #! 精度
     #     )
 
     #     return latent
+if __name__ == "__main__":
+    encoder = PianoTranscriptionCRnn(sr=16000, trainable=False)
+    print("Encoder latent dim:", encoder.latent_dim)
+    print("Encoder fps:", encoder.fps)
+    audio_fake = torch.randn(2, 1, 16000 * 5)  # (b, c, t)
+    latent = encoder.encode(audio_fake, train_mode=False)
+    print("Encoded latent shape:", latent.shape)    

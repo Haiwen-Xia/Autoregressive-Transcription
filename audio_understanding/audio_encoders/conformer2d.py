@@ -77,6 +77,7 @@ class Conformer2D(Fourier):
         self.train_mode = trainable
         self.latent_dim = config.n_embd
         self.use_decoder = use_decoder
+        self.fps = 25.0
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
