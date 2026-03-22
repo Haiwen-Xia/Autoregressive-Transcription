@@ -196,6 +196,8 @@ def main_func(cfg: DictConfig) -> None:
             audio_latent_dim=cast(Any, audio_encoder).latent_dim,
             vocab_size=len(cast(Any, tokenizer)),
             ckpt_path=configs["train"]["resume_ckpt_path"],
+            audio_encoder=audio_encoder,
+            tokenizer=tokenizer,
         )
 
         audio_total, audio_trainable = _count_model_params(audio_encoder)

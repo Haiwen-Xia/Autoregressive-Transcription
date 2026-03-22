@@ -3,11 +3,18 @@ Modified from https://github.com/qiuqiangkong/mini_llm/blob/main/models/llama.py
 """
 import math
 from dataclasses import dataclass
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from audio_understanding.llm.rope import build_rope, apply_rope
+from audio_understanding.llm.rope import build_rope, apply_mixed_rope
+from audio_understanding.llm.time_rope import (
+    DEFAULT_EVENT_ATTRIBUTE_PREFIXES,
+    build_position_time_inputs,
+    infer_current_event_time_from_tokens,
+    update_decode_state,
+)
 
 
 #* is one singular rope for all modalities good?
@@ -21,6 +28,14 @@ class LlamaConfig:
     n_embd: int = 4096
     audio_use_absolute_pe: bool = False
     rope_scope: str = "all"
+    time_aware_rope: bool = False
+    time_rope_mix_weight: float = 0.5
+    time_rope_audio_fps: float = 100.0
+    time_rope_token_fps: float = 100.0
+    time_rope_alpha: None | float = None
+    time_rope_event_attribute_prefixes: tuple[str, ...] = DEFAULT_EVENT_ATTRIBUTE_PREFIXES
+    time_rope_use_linear: bool = False  # Use linear angle interpolation instead of output mixing
+    id_to_token: None | Callable[[list[int]], list[str]] = None
 
 
 # Default Llama configurations
@@ -40,6 +55,10 @@ class Llama(nn.Module):
 
         self.config = config
         assert self.config.rope_scope in ["all", "text_only"]
+        assert 0.0 <= self.config.time_rope_mix_weight <= 1.0
+        if self.config.time_rope_alpha is None:
+            self.config.time_rope_alpha = float(self.config.time_rope_audio_fps)
+        assert self.config.time_rope_alpha > 0
 
         # Audio to embedding
         self.a2e = nn.Linear(config.audio_latent_dim, config.n_embd)
@@ -52,7 +71,7 @@ class Llama(nn.Module):
 
         # Output layers
         self.ln_f = RMSNorm(config.n_embd)
-        self.audio_head = nn.Linear(config.n_embd, config.audio_latent_dim, bias=False)
+        self.audio_head = nn.Linear(config.n_embd, config.audio_latent_dim, bias=False) #* seems uncessary
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Build RoPE cache
@@ -111,9 +130,34 @@ class Llama(nn.Module):
 
         rope_apply_mask = self.build_rope_apply_mask(seqs=seqs, seq_types=seq_types, seq_len=T, device=device)
 
+        time_coords = None
+        use_time_rope = None
+        if self.config.time_aware_rope:
+            alpha = self.config.time_rope_alpha
+            assert alpha is not None
+            _, time_coords, use_time_rope = build_position_time_inputs(
+                seqs=seqs,
+                seq_types=seq_types,
+                id_to_token=self.config.id_to_token,
+                audio_fps=self.config.time_rope_audio_fps,
+                token_fps=self.config.time_rope_token_fps,
+                alpha=float(alpha),
+                event_attribute_prefixes=self.config.time_rope_event_attribute_prefixes,
+                strict_event_time=True,
+            )
+
         # Transformer
         for block in self.blocks:
-            x = block(x, self.rope, mask, rope_apply_mask)
+            x = block(
+                x=x,
+                rope=self.rope,
+                mask=mask,
+                rope_apply_mask=rope_apply_mask,
+                time_coords=time_coords,
+                use_time_rope=use_time_rope,
+                time_rope_mix_weight=self.config.time_rope_mix_weight,
+                time_rope_angle_interpolate=self.config.time_rope_use_linear,
+            )
         # x: (b, t, d)
 
         # Output layers
@@ -180,6 +224,23 @@ class Llama(nn.Module):
         assert rope_apply_mask.shape[0] == seq_len
         return rope_apply_mask
 
+    def _decode_ids_to_tokens(self, ids: list[int]) -> None | list[str]:
+        if self.config.id_to_token is None:
+            return None
+        return self.config.id_to_token(ids)
+
+    def update_decode_time_state(
+        self,
+        new_token: str,
+        current_event_time: None | float,
+    ) -> None | float:
+        return update_decode_state(
+            new_token=new_token,
+            current_event_time=current_event_time,
+            token_fps=self.config.time_rope_token_fps,
+            event_attribute_prefixes=self.config.time_rope_event_attribute_prefixes,
+        )
+
     def latent_to_seqs(
         self, 
         latent: torch.Tensor, 
@@ -237,6 +298,15 @@ class Llama(nn.Module):
         """
         # input_len = ids.shape[1]
 
+        decode_state: None | float = None
+        if self.config.time_aware_rope and self.config.id_to_token is not None:
+            seed_tokens = self.config.id_to_token(seqs[-1][0].detach().cpu().tolist())
+            decode_state = infer_current_event_time_from_tokens(
+                seed_tokens,
+                token_fps=self.config.time_rope_token_fps,
+                event_attribute_prefixes=self.config.time_rope_event_attribute_prefixes,
+            )
+
         for t in range(max_new_ids):
             # Forward
             outputs = self(seqs=seqs, seq_types=seq_types)
@@ -260,6 +330,10 @@ class Llama(nn.Module):
 
             # Append the sampled token to the last seq
             seqs[-1] = torch.cat((seqs[-1], next_id), dim=1)  # shape: (b, t)
+
+            if self.config.time_aware_rope and self.config.id_to_token is not None:
+                next_token = self.config.id_to_token([int(next_id[0, 0].item())])[0]
+                decode_state = self.update_decode_time_state(next_token, decode_state)
 
         return seqs
 
@@ -290,6 +364,15 @@ class Llama(nn.Module):
         Returns:
             seqs: updated sequences with generated tokens appended to seqs[-1]
         """
+        decode_state: None | float = None
+        if self.config.time_aware_rope and self.config.id_to_token is not None:
+            seed_tokens = self.config.id_to_token(seqs[-1][0].detach().cpu().tolist())
+            decode_state = infer_current_event_time_from_tokens(
+                seed_tokens,
+                token_fps=self.config.time_rope_token_fps,
+                event_attribute_prefixes=self.config.time_rope_event_attribute_prefixes,
+            )
+
         for _t in range(max_new_ids):
             outputs = self(seqs=seqs, seq_types=seq_types)
 
@@ -312,6 +395,10 @@ class Llama(nn.Module):
 
             probs = F.softmax(logits, dim=-1)  # shape: (b, v)
             next_id = torch.multinomial(probs, num_samples=1)  # shape: (b, 1)
+
+            if self.config.time_aware_rope and self.config.id_to_token is not None:
+                next_token = self.config.id_to_token([int(next_id[0, 0].item())])[0]
+                decode_state = self.update_decode_time_state(next_token, decode_state)
 
             # --- state transition; stop on SEP ---
             should_continue = constraint.update(next_id[0, 0].item())
@@ -353,6 +440,17 @@ class Llama(nn.Module):
         assert len(constraints) == batch_size
 
         active = [True] * batch_size
+        decode_states: None | list[None | float] = None
+        if self.config.time_aware_rope and self.config.id_to_token is not None:
+            decode_states = []
+            for b in range(batch_size):
+                seed_tokens = self.config.id_to_token(seqs[-1][b].detach().cpu().tolist())
+                decode_state = infer_current_event_time_from_tokens(
+                    seed_tokens,
+                    token_fps=self.config.time_rope_token_fps,
+                    event_attribute_prefixes=self.config.time_rope_event_attribute_prefixes,
+                )
+                decode_states.append(decode_state)
 
         for _t in range(max_new_ids):
             outputs = self(seqs=seqs, seq_types=seq_types)
@@ -377,6 +475,14 @@ class Llama(nn.Module):
 
             probs = F.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)  # (b, 1)
+
+            if self.config.time_aware_rope and self.config.id_to_token is not None:
+                assert decode_states is not None
+                for b in range(batch_size):
+                    if not active[b]:
+                        continue
+                    next_token = self.config.id_to_token([int(next_id[b, 0].item())])[0]
+                    decode_states[b] = self.update_decode_time_state(next_token, decode_states[b])
 
             seqs[-1] = torch.cat((seqs[-1], next_id), dim=1)
 
@@ -407,6 +513,10 @@ class Block(nn.Module):
         rope: torch.Tensor,
         mask: torch.Tensor,
         rope_apply_mask: None | torch.Tensor,
+        time_coords: None | torch.Tensor,
+        use_time_rope: None | torch.Tensor,
+        time_rope_mix_weight: float,
+        time_rope_angle_interpolate: bool = False,
     ) -> torch.Tensor:
         r"""
 
@@ -418,7 +528,16 @@ class Block(nn.Module):
         Outputs:
             x: (b, t, d)
         """
-        x = x + self.att(self.att_norm(x), rope, mask, rope_apply_mask)
+        x = x + self.att(
+            x=self.att_norm(x),
+            rope=rope,
+            mask=mask,
+            rope_apply_mask=rope_apply_mask,
+            time_coords=time_coords,
+            use_time_rope=use_time_rope,
+            time_rope_mix_weight=time_rope_mix_weight,
+            time_rope_angle_interpolate=time_rope_angle_interpolate,
+        )
         x = x + self.mlp(self.ffn_norm(x))
         return x
 
@@ -469,6 +588,10 @@ class CausalSelfAttention(nn.Module):
         rope: torch.Tensor,
         mask: torch.Tensor,
         rope_apply_mask: None | torch.Tensor,
+        time_coords: None | torch.Tensor,
+        use_time_rope: None | torch.Tensor,
+        time_rope_mix_weight: float,
+        time_rope_angle_interpolate: bool = False,
     ) -> torch.Tensor:
         r"""Causal self attention.
 
@@ -496,8 +619,24 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, D // self.n_head)
         # q, k, v shapes: (b, t, h, head_dim)
 
-        q = apply_rope(q, rope, rope_apply_mask=rope_apply_mask)
-        k = apply_rope(k, rope, rope_apply_mask=rope_apply_mask)
+        q = apply_mixed_rope(
+            x=q,
+            rope_cache=rope,
+            rope_apply_mask=rope_apply_mask,
+            time_coords=time_coords,
+            use_time_rope=use_time_rope,
+            mix_weight=time_rope_mix_weight,
+            angle_interpolate=time_rope_angle_interpolate,
+        )
+        k = apply_mixed_rope(
+            x=k,
+            rope_cache=rope,
+            rope_apply_mask=rope_apply_mask,
+            time_coords=time_coords,
+            use_time_rope=use_time_rope,
+            mix_weight=time_rope_mix_weight,
+            angle_interpolate=time_rope_angle_interpolate,
+        )
         # q, k shapes: (b, t, h, head_dim)
 
         k = k.transpose(1, 2)

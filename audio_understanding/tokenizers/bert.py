@@ -9,9 +9,10 @@ class Bert:
     r"""Extend text tokenizer with discrete audio codec vocabularies.
     """
     
-    def __init__(self) -> None:
+    def __init__(self, fps: None | float = None) -> None:
 
         self.tok = AutoTokenizer.from_pretrained("bert-base-uncased")
+        self._fps = fps
 
         # Merge text tokens and audio tokens
         print("Original vocab size: {}".format(len(self.tok)))
@@ -64,6 +65,9 @@ class Bert:
 
     def __len__(self):
         return len(self.tok)
+
+    def get_fps(self) -> None | float:
+        return self._fps
 
     @property
     def cls_token_id(self):

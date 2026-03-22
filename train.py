@@ -20,7 +20,7 @@ from tqdm import tqdm
 import wandb
 from audio_understanding.data.samplers import InfiniteSampler
 from audio_understanding.eval.transcription.batch_eval import batch_evaluate
-from audio_understanding.utils import LinearWarmUp, remove_padded_columns
+from audio_understanding.utils import LinearWarmUp, parse_yaml, remove_padded_columns
 from inference_transcription import transcribe_audio, format_tokens_by_event, tokens_to_midi
 import soundfile as sf
 
@@ -135,6 +135,8 @@ def main_func(cfg: DictConfig) -> None:
         audio_latent_dim=cast(Any, audio_encoder).latent_dim,
         vocab_size=len(cast(Any, tokenizer)),
         ckpt_path=configs["train"]["resume_ckpt_path"],
+        audio_encoder=audio_encoder,
+        tokenizer=tokenizer,
     ).to(device)
 
     # Learnable parameters
@@ -715,7 +717,23 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
             model.load_state_dict(ckpt["audio_encoder"])
             logging.info("Loaded audio encoder weights from joint checkpoint %s", ckpt_path)
 
+    assert hasattr(model, "fps"), "audio_encoder must expose .fps"
+    assert float(cast(Any, model).fps) > 0.0
+
     return model
+
+
+def get_fps(module: Any, module_name: str) -> float:
+    fps = None
+    if hasattr(module, "get_fps"):
+        fps = module.get_fps()
+    elif hasattr(module, "fps"):
+        fps = module.fps
+
+    assert fps is not None, f"{module_name} must expose get_fps() or .fps"
+    fps = float(fps)
+    assert fps > 0.0, f"{module_name} fps must be positive"
+    return fps
 
 
 def get_tokenizer(configs: dict) -> Any:
@@ -723,7 +741,15 @@ def get_tokenizer(configs: dict) -> Any:
 
     name = configs["tokenizer"]["name"]
     drum_pitch = bool(configs["tokenizer"].get("drum_pitch", False))
+    tokenizer = _build_tokenizer_by_name(
+        name=name,
+        drum_pitch=drum_pitch,
+    )
 
+    return tokenizer
+
+
+def _build_tokenizer_by_name(name: str, drum_pitch: bool) -> Any:
     if name == "Bert":
         from audio_understanding.tokenizers.bert import Bert
 
@@ -734,13 +760,189 @@ def get_tokenizer(configs: dict) -> Any:
 
         tokenizer = BertMIDI(drum_pitch=drum_pitch)
 
+    elif name == "BertOnset":
+        from audio_understanding.tokenizers.bert_onset import BertOnset
+
+        tokenizer = BertOnset(drum_pitch=drum_pitch)
+
     else:
         raise ValueError(name)
 
     return tokenizer
 
 
-def get_llm(configs: dict, audio_latent_dim: int, vocab_size: int, ckpt_path: str) -> nn.Module:
+def _extract_llm_state_dict(ckpt_obj: dict) -> dict:
+    if "llm" in ckpt_obj:
+        return cast(dict, ckpt_obj["llm"])
+    return ckpt_obj
+
+
+def _build_source_tokenizer_for_transfer(
+    configs: dict,
+    ckpt_vocab_size: int,
+    source_ckpt_path: str,
+) -> Any:
+    llm_cfg = configs["llm"]
+    tokenizer_cfg = configs["tokenizer"]
+    target_drum_pitch = bool(tokenizer_cfg.get("drum_pitch", False))
+    source_cfg = llm_cfg.get("source_tokenizer", {})
+
+    if source_cfg:
+        source_name = str(source_cfg["name"])
+        source_drum_pitch = bool(source_cfg.get("drum_pitch", target_drum_pitch))
+    else:
+        source_ckpt = Path(source_ckpt_path)
+        source_config_yaml = source_ckpt.parent.parent / "config.yaml"
+        source_configs = parse_yaml(str(source_config_yaml))
+        source_name = str(source_configs["tokenizer"]["name"])
+        source_drum_pitch = bool(source_configs["tokenizer"].get("drum_pitch", target_drum_pitch))
+        logging.info(
+            "Auto-detected source tokenizer from %s: name=%s drum_pitch=%s",
+            source_config_yaml,
+            source_name,
+            source_drum_pitch,
+        )
+
+    source_tokenizer = _build_tokenizer_by_name(
+        name=source_name,
+        drum_pitch=source_drum_pitch,
+    )
+    assert len(source_tokenizer) == ckpt_vocab_size, (
+        f"Source tokenizer vocab size mismatch: source={len(source_tokenizer)}, "
+        f"checkpoint={ckpt_vocab_size}. Please set llm.source_tokenizer explicitly."
+    )
+    return source_tokenizer
+
+
+def _strict_load_llm_with_vocab_transfer(
+    model: nn.Module,
+    llm_state: dict,
+    target_tokenizer: Any,
+    source_tokenizer: Any,
+    ckpt_desc: str,
+) -> None:
+    model_state = model.state_dict()
+    special_keys = {"wte.weight", "lm_head.weight"}
+
+    model_non_special = {k for k in model_state if k not in special_keys}
+    ckpt_non_special = {k for k in llm_state if k not in special_keys}
+
+    unexpected = ckpt_non_special - model_non_special
+    missing = model_non_special - ckpt_non_special
+    assert not unexpected, f"LLM unexpected non-vocab keys in {ckpt_desc}: {sorted(unexpected)}"
+    assert not missing, f"LLM missing non-vocab keys in {ckpt_desc}: {sorted(missing)}"
+
+    new_state = {}
+    for key in model_non_special:
+        ckpt_tensor = llm_state[key]
+        model_tensor = model_state[key]
+        assert ckpt_tensor.shape == model_tensor.shape, (
+            f"LLM non-vocab shape mismatch in {ckpt_desc} for {key}: "
+            f"ckpt={tuple(ckpt_tensor.shape)} vs model={tuple(model_tensor.shape)}"
+        )
+        new_state[key] = ckpt_tensor
+
+    source_vocab = source_tokenizer.tok.get_vocab()
+    target_vocab = target_tokenizer.tok.get_vocab()
+    source_id_to_token = [""] * len(source_vocab)
+    for token, idx in source_vocab.items():
+        source_id_to_token[idx] = token
+
+    for key in special_keys:
+        if key not in llm_state:
+            logging.warning("LLM key %s not found in %s, keep random init", key, ckpt_desc)
+            continue
+
+        ckpt_tensor = llm_state[key]
+        model_tensor = model_state[key]
+        assert ckpt_tensor.ndim == 2 and model_tensor.ndim == 2
+        assert ckpt_tensor.shape[1] == model_tensor.shape[1], (
+            f"Embedding dim mismatch in {ckpt_desc} for {key}: "
+            f"ckpt={tuple(ckpt_tensor.shape)} vs model={tuple(model_tensor.shape)}"
+        )
+
+        transferred = model_tensor.clone()
+        migrated_tokens = []
+        for src_id, token in enumerate(source_id_to_token):
+            if token in target_vocab:
+                tgt_id = target_vocab[token]
+                transferred[tgt_id] = ckpt_tensor[src_id]
+                migrated_tokens.append(token)
+
+        new_state[key] = transferred
+        logging.info(
+            "Vocab transferred for %s from %s: %d tokens",
+            key,
+            ckpt_desc,
+            len(migrated_tokens),
+        )
+        logging.info("Migrated vocab tokens for %s: %s", key, migrated_tokens)
+
+    model.load_state_dict(new_state, strict=False)
+
+
+def _load_llm_checkpoint_state(
+    model: nn.Module,
+    configs: dict,
+    raw_ckpt_obj: dict,
+    target_tokenizer: None | Any,
+    ckpt_desc: str,
+    source_ckpt_path: str,
+) -> None:
+    llm_state = _extract_llm_state_dict(raw_ckpt_obj)
+    model_state = model.state_dict()
+
+    if "wte.weight" in llm_state and "wte.weight" in model_state:
+        ckpt_vocab_size = int(llm_state["wte.weight"].shape[0])
+        model_vocab_size = int(model_state["wte.weight"].shape[0])
+    else:
+        ckpt_vocab_size = -1
+        model_vocab_size = -1
+
+    need_transfer = (
+        target_tokenizer is not None
+        and ckpt_vocab_size > 0
+        and model_vocab_size > 0
+        and ckpt_vocab_size != model_vocab_size
+    )
+
+    if need_transfer:
+        assert str(configs["llm"]["name"]) == "Llama", "Vocab transfer is only implemented for Llama"
+        source_tokenizer = _build_source_tokenizer_for_transfer(
+            configs=configs,
+            ckpt_vocab_size=ckpt_vocab_size,
+            source_ckpt_path=source_ckpt_path,
+        )
+        _strict_load_llm_with_vocab_transfer(
+            model=model,
+            llm_state=llm_state,
+            target_tokenizer=target_tokenizer,
+            source_tokenizer=source_tokenizer,
+            ckpt_desc=ckpt_desc,
+        )
+        return
+
+    skipped_shape = {k for k, v in llm_state.items() if k in model_state and v.shape != model_state[k].shape}
+    unexpected = {k for k in llm_state if k not in model_state}
+    missing = {k for k in model_state if k not in llm_state}
+    if skipped_shape:
+        logging.warning("LLM skipped keys due to shape mismatch: %s", {k: (llm_state[k].shape, model_state[k].shape) for k in skipped_shape})
+    if unexpected:
+        logging.warning("LLM unexpected keys in checkpoint (ignored): %s", unexpected)
+    if missing:
+        logging.warning("LLM missing keys in checkpoint (using init): %s", missing)
+    filtered_ckpt = {k: v for k, v in llm_state.items() if k in model_state and k not in skipped_shape}
+    model.load_state_dict(filtered_ckpt, strict=False)
+
+
+def get_llm(
+    configs: dict,
+    audio_latent_dim: int,
+    vocab_size: int,
+    ckpt_path: str,
+    audio_encoder: Any,
+    tokenizer: None | Any = None,
+) -> nn.Module:
     r"""Initialize LLM decoder."""
 
     name = configs["llm"]["name"]
@@ -758,6 +960,41 @@ def get_llm(configs: dict, audio_latent_dim: int, vocab_size: int, ckpt_path: st
         audio_use_absolute_pe = bool(configs["llm"].get("audio_use_absolute_pe", False))
         rope_scope = str(configs["llm"].get("rope_scope", "all"))
 
+        time_rope_cfg = configs["llm"].get("time_aware_rope", {})
+        time_aware_rope = bool(time_rope_cfg.get("enable", False))
+        time_rope_mix_weight = float(time_rope_cfg.get("mix_weight", 0.5))
+        time_rope_use_linear = bool(time_rope_cfg.get("use_linear", False))
+        time_rope_audio_fps = get_fps(audio_encoder, module_name="audio_encoder")
+        time_rope_token_fps = float(configs["fps"])
+        time_rope_alpha_cfg = time_rope_cfg.get("alpha")
+        if time_rope_alpha_cfg is None:
+            time_rope_alpha = float(time_rope_audio_fps)
+        else:
+            time_rope_alpha = float(time_rope_alpha_cfg)
+        time_rope_event_attribute_prefixes = tuple(
+            time_rope_cfg.get(
+                "event_attribute_prefixes",
+                [
+                    "onset",
+                    "offset",
+                    "duration",
+                    "pitch=",
+                    "drum_pitch=",
+                    "velocity=",
+                    "program=",
+                ],
+            )
+        )
+
+        id_to_token = None
+        if tokenizer is not None and hasattr(tokenizer, "tok"):
+            tok = tokenizer.tok
+
+            def _ids_to_tokens(ids: list[int]) -> list[str]:
+                return cast(list[str], tok.convert_ids_to_tokens(ids))
+
+            id_to_token = _ids_to_tokens
+
         config = LlamaConfig(
             block_size=block_size,
             audio_latent_dim=audio_latent_dim,
@@ -767,6 +1004,14 @@ def get_llm(configs: dict, audio_latent_dim: int, vocab_size: int, ckpt_path: st
             n_embd=n_embd,
             audio_use_absolute_pe=audio_use_absolute_pe,
             rope_scope=rope_scope,
+            time_aware_rope=time_aware_rope,
+            time_rope_mix_weight=time_rope_mix_weight,
+            time_rope_use_linear=time_rope_use_linear,
+            time_rope_audio_fps=time_rope_audio_fps,
+            time_rope_token_fps=time_rope_token_fps,
+            time_rope_alpha=time_rope_alpha,
+            time_rope_event_attribute_prefixes=time_rope_event_attribute_prefixes,
+            id_to_token=id_to_token,
         )
         model = Llama(config=config)
 
@@ -796,23 +1041,26 @@ def get_llm(configs: dict, audio_latent_dim: int, vocab_size: int, ckpt_path: st
 
     if configs["llm"]["ckpt_path"]:
         ckpt = torch.load(configs["llm"]["ckpt_path"], map_location="cpu")
-        model_state = model.state_dict()
-        skipped_shape = {k for k, v in ckpt.items() if k in model_state and v.shape != model_state[k].shape}
-        unexpected = {k for k in ckpt if k not in model_state}
-        missing = {k for k in model_state if k not in ckpt}
-        if skipped_shape:
-            logging.warning("LLM skipped keys due to shape mismatch: %s", {k: (ckpt[k].shape, model_state[k].shape) for k in skipped_shape})
-        if unexpected:
-            logging.warning("LLM unexpected keys in checkpoint (ignored): %s", unexpected)
-        if missing:
-            logging.warning("LLM missing keys in checkpoint (using init): %s", missing)
-        filtered_ckpt = {k: v for k, v in ckpt.items() if k in model_state and k not in skipped_shape}
-        model.load_state_dict(filtered_ckpt, strict=False) #* there is no state dict key for llm key 
+        _load_llm_checkpoint_state(
+            model=model,
+            configs=configs,
+            raw_ckpt_obj=ckpt,
+            target_tokenizer=tokenizer,
+            ckpt_desc=str(configs["llm"]["ckpt_path"]),
+            source_ckpt_path=str(configs["llm"]["ckpt_path"]),
+        )
         logging.info("Loaded LLM weights from %s", configs["llm"]["ckpt_path"])
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location="cpu")
         if "llm" in ckpt:
-            model.load_state_dict(ckpt["llm"])
+            _load_llm_checkpoint_state(
+                model=model,
+                configs=configs,
+                raw_ckpt_obj=ckpt,
+                target_tokenizer=tokenizer,
+                ckpt_desc=str(ckpt_path),
+                source_ckpt_path=str(ckpt_path),
+            )
             logging.info("Loaded LLM weights from joint checkpoint %s", ckpt_path)
 
     return model

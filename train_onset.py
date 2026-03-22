@@ -393,6 +393,8 @@ def main_func(cfg: DictConfig) -> None:
         audio_latent_dim=cast(Any, audio_encoder).latent_dim,
         vocab_size=len(cast(Any, tokenizer)),
         ckpt_path=configs["train"]["resume_ckpt_path"],
+        audio_encoder=audio_encoder,
+        tokenizer=tokenizer,
     ).to(device)
 
     params = get_learnable_params(configs, audio_encoder, llm)

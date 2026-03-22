@@ -1098,7 +1098,10 @@ def main_func(args: argparse.Namespace) -> None:
 
     run_dir = Path(args.dir).resolve()
     eval_dir = run_dir / "eval"
-    full_ckpt_path = Path(__file__).resolve().parent / "full_checkpoints.json"
+    summary_path_arg = args.summary_path_opt if args.summary_path_opt else args.summary_path
+    if summary_path_arg:
+        summary_path = Path(summary_path_arg).resolve()
+    full_ckpt_path = Path(__file__).resolve().parent / "full_checkpoints.json" if not summary_path_arg else summary_path
 
     config_path = run_dir / "config.yaml"
     ckpt_dir = run_dir / "ckpt"
@@ -1108,7 +1111,10 @@ def main_func(args: argparse.Namespace) -> None:
     print(f"Loaded config: {config_path}")
 
     # Find latest checkpoint
-    ckpt_path = find_latest_checkpoint(ckpt_dir)
+    if not args.path:
+        ckpt_path = find_latest_checkpoint(ckpt_dir)
+    else:
+        ckpt_path = Path(args.path).resolve()
     print(f"Using checkpoint: {ckpt_path}")
 
     device = args.device
@@ -1125,6 +1131,8 @@ def main_func(args: argparse.Namespace) -> None:
         audio_latent_dim=audio_latent_dim,
         vocab_size=len(tokenizer),
         ckpt_path=str(ckpt_path),
+        audio_encoder=audio_encoder,
+        tokenizer=tokenizer,
     ).to(device)
 
     audio_encoder.eval()
@@ -1268,6 +1276,26 @@ def main() -> None:
         "dir",
         type=str,
         help="Run directory containing config.yaml and ckpt/step=N.pth files.",
+    )
+    parser.add_argument(
+        "--path",
+        type=str,
+        default=None,
+        help="Path to a specific checkpoint file. Use --dir instead to test the best.",
+    )
+    parser.add_argument(
+        "summary_path",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Optional path to an isolated metrics registry JSON."
+    )
+    parser.add_argument(
+        "--summary_path",
+        dest="summary_path_opt",
+        type=str,
+        default=None,
+        help="Preferred explicit form of summary_path; avoids writing to global full_checkpoints.json.",
     )
     parser.add_argument("--device", type=str, default="cuda:1")
     parser.add_argument(
