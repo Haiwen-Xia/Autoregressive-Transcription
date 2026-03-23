@@ -93,6 +93,7 @@ def main_func(cfg: DictConfig) -> None:
         wandb.save(str(cfg_save_path))
 
     device = configs["train"]["device"]
+    no_metrics = bool(configs["train"].get("no_metrics", False))
 
     train_dataset = cast(Any, get_dataset(configs, split="train"))
     test_dataset = cast(Any, get_dataset(configs, split="test"))
@@ -152,6 +153,8 @@ def main_func(cfg: DictConfig) -> None:
         llm_total // 1024**2,
         llm_trainable // 1024**2,
     )
+    if no_metrics:
+        logger.info("train.no_metrics=True: skip transcription sample logging and batch F1 metrics")
     
     gradient_accumulation = configs["train"]["gradient_accumulation"] if "gradient_accumulation" in configs["train"] else 1
     assert gradient_accumulation > 0
@@ -287,44 +290,47 @@ def main_func(cfg: DictConfig) -> None:
             logger.info("Save model to %s", ckpt_path)
 
         # ------ Transcription sample logging (at save steps) ------
-        if global_step * 10 % configs["train"]["save_every_n_steps"] == 0:
+        if (not no_metrics) and (global_step * 10 % configs["train"]["save_every_n_steps"] == 0):
+            
             train_log_n_samples = int(configs["train"].get("transcription_train_n_samples", 1))
             test_log_n_samples = int(configs["train"].get("transcription_test_n_samples", 2))
-
             logger.info("Logging train data samples:")
-            _log_transcription_samples(
-                configs=configs,
-                dataset=train_dataset,
-                audio_encoder=audio_encoder,
-                tokenizer=tokenizer,
-                llm=llm,
-                output_dir=output_dir,
-                step=global_step,
-                logger=logger,
-                device=device,
-                n_samples=train_log_n_samples,
-                split_name="train",
-                run_batch_eval=False,
-            )
-            
-            logger.info("Logging test data samples and metrics:")
-            test_metrics = _log_transcription_samples(
-                configs=configs,
-                dataset=test_dataset,
-                audio_encoder=audio_encoder,
-                tokenizer=tokenizer,
-                llm=llm,
-                output_dir=output_dir,
-                step=global_step,
-                logger=logger,
-                device=device,
-                n_samples=test_log_n_samples,
-                split_name="test",
-                run_batch_eval=True,
-            )
-            if wandb_log:
-                wandb.log(data=test_metrics, step=global_step)
-
+            try:
+                _log_transcription_samples(
+                    configs=configs,
+                    dataset=train_dataset,
+                    audio_encoder=audio_encoder,
+                    tokenizer=tokenizer,
+                    llm=llm,
+                    output_dir=output_dir,
+                    step=global_step,
+                    logger=logger,
+                    device=device,
+                    n_samples=train_log_n_samples,
+                    split_name="train",
+                    run_batch_eval=False,
+                )
+                
+                logger.info("Logging test data samples and metrics:")
+                test_metrics = _log_transcription_samples(
+                    configs=configs,
+                    dataset=test_dataset,
+                    audio_encoder=audio_encoder,
+                    tokenizer=tokenizer,
+                    llm=llm,
+                    output_dir=output_dir,
+                    step=global_step,
+                    logger=logger,
+                    device=device,
+                    n_samples=test_log_n_samples,
+                    split_name="test",
+                    run_batch_eval=True,
+                )
+                if wandb_log:
+                    wandb.log(data=test_metrics, step=global_step)
+            except Exception as e:
+                logger.error("Error during transcription sample logging at step %d: %s", global_step, str(e))
+                continue
         if global_step == configs["train"]["training_steps"]:
             break
         
@@ -500,6 +506,12 @@ def get_dataset(
     clip_duration = configs["clip_duration"]
     include_program = configs["midi_include_program"] if "midi_include_program" in configs else False
     include_drum = configs["include_drum"] if "include_drum" in configs else True
+    if "midi_event_token_order" in configs:
+        midi_event_token_order = configs["midi_event_token_order"]
+    else:
+        logging.warning("midi_event_token_order not specified in config, default to 'name_first'")
+        midi_event_token_order = "name_first"
+        input("Press Enter to continue...")
     tokenizer_cfg = configs["tokenizer"] if "tokenizer" in configs else {}
     drum_pitch = bool(tokenizer_cfg.get("drum_pitch", False))
     datasets_split = f"{split}_datasets"
@@ -546,16 +558,25 @@ def get_dataset(
 
         elif name == "MAESTRO":
             from audio_understanding.datasets.maestro import MAESTRO
-            from audio_understanding.target_transforms.midi import MIDI2Tokens
-
             if configs["midi_to_tokens"] == "MIDI2Tokens":
+                from audio_understanding.target_transforms.midi import MIDI2Tokens
+
                 midi_transform = MIDI2Tokens(
                     fps=configs["fps"],
                     include_program=include_program,
                     drum_pitch=drum_pitch,
+                    event_token_order=midi_event_token_order,
+                )
+            elif configs["midi_to_tokens"] == "MIDI2OnsetTokens":
+                from audio_understanding.target_transforms.midi_onset import MIDI2OnsetTokens
+
+                midi_transform = MIDI2OnsetTokens(
+                    fps=configs["fps"],
+                    drum_pitch=drum_pitch,
                 )
             else:
-                raise NotImplementedError
+                raise NotImplementedError(configs["midi_to_tokens"])
+
 
             dataset = MAESTRO(
                 root=configs[datasets_split][name]["root"],
@@ -572,16 +593,24 @@ def get_dataset(
 
         elif name == "Slakh2100":
             from audio_understanding.datasets.slakh2100 import Slakh2100
-            from audio_understanding.target_transforms.midi import MIDI2Tokens
-
             if configs["midi_to_tokens"] == "MIDI2Tokens":
+                from audio_understanding.target_transforms.midi import MIDI2Tokens
+
                 midi_transform = MIDI2Tokens(
                     fps=configs["fps"],
                     include_program=include_program,
                     drum_pitch=drum_pitch,
+                    event_token_order=midi_event_token_order,
+                )
+            elif configs["midi_to_tokens"] == "MIDI2OnsetTokens":
+                from audio_understanding.target_transforms.midi_onset import MIDI2OnsetTokens
+
+                midi_transform = MIDI2OnsetTokens(
+                    fps=configs["fps"],
+                    drum_pitch=drum_pitch,
                 )
             else:
-                raise NotImplementedError
+                raise NotImplementedError(configs["midi_to_tokens"])
 
             dataset_config = configs[datasets_split][name]
             mode = dataset_config["mode"] if "mode" in dataset_config else "all"
@@ -691,8 +720,9 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
     else:
         raise ValueError(name)
 
-    for param in model.parameters():
-        param.requires_grad = trainable
+    if not trainable:
+        for param in model.parameters():
+            param.requires_grad = False
 
     if configs["audio_encoder"]["ckpt_path"]:
         ckpt = torch.load(configs["audio_encoder"]["ckpt_path"], map_location="cpu")
@@ -749,7 +779,10 @@ def get_tokenizer(configs: dict) -> Any:
     return tokenizer
 
 
-def _build_tokenizer_by_name(name: str, drum_pitch: bool) -> Any:
+def _build_tokenizer_by_name(
+    name: str,
+    drum_pitch: bool,
+) -> Any:
     if name == "Bert":
         from audio_understanding.tokenizers.bert import Bert
 
@@ -758,7 +791,9 @@ def _build_tokenizer_by_name(name: str, drum_pitch: bool) -> Any:
     elif name == "BertMIDI":
         from audio_understanding.tokenizers.bert_midi import BertMIDI
 
-        tokenizer = BertMIDI(drum_pitch=drum_pitch)
+        tokenizer = BertMIDI(
+            drum_pitch=drum_pitch,
+        )
 
     elif name == "BertOnset":
         from audio_understanding.tokenizers.bert_onset import BertOnset

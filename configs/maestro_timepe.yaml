@@ -5,7 +5,7 @@ max_question_len: 50
 max_answering_len: 1000
 output_root: "./maestro"
 fps: 100
-run_name: time_first_base
+run_name: 2d_correct
 train_datasets:
     MAESTRO:
         root: "./datasets/maestro-v3.0.0"
@@ -23,6 +23,7 @@ midi_event_token_order: time_first
 audio_encoder:
     name: PianoTranscriptionCRnn # Conformer2d
     trainable: True
+    force_all_trainable: false
     
     # random_init: True  # True: from scratch (random init), False: load pretrained from piano_transcription_inference
 
@@ -39,11 +40,15 @@ llm:
     n_head: 12
     n_embd: 768
     time_aware_rope:
-      enable: false
+      enable: true
+      mode: time_aware_2d
+      mix_weight: 0.8
+      use_linear: true
+      alpha: 100
 
     
 train:
-    device: "cuda:2"
+    device: "cuda:3"
     num_workers: 16
     remove_padded_columns: True
     loss: ce_loss

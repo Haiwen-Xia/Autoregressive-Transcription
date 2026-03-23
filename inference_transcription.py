@@ -1,7 +1,8 @@
 """Music transcription inference with constrained decoding.
 
 Constrained decoding enforces the MIDI token grammar (MIDI2Tokens construction order):
-    time_index -> name -> pitch -> velocity (onset only) -> program (optional)
+    time_first: time_index -> name -> pitch -> velocity (onset only) -> program (optional)
+    name_first: name -> time_index -> pitch -> velocity (onset only) -> program (optional)
 and tracks how many top-k candidates violate the grammar at each step.
 
 Usage:
@@ -62,6 +63,7 @@ def transcribe_audio(
     """
     device = audio_tensor.device
     include_program = configs.get("midi_include_program", False)
+    midi_event_token_order = configs.get("midi_event_token_order", "time_first")
 
     # Encode audio
     audio_latent = audio_encoder.encode(audio=audio_tensor, train_mode=False)  # (1, t, d)
@@ -83,6 +85,7 @@ def transcribe_audio(
         tokenizer=tokenizer,
         vocab_size=len(tokenizer),
         include_program=include_program,
+        token_order=midi_event_token_order,
         device=device,
     )
 
@@ -126,6 +129,43 @@ def transcribe_audio(
 
 # ── tokens formatting ──────────────────────────────────────────────────
 
+def _extract_event_chunks(tokens: list[str]) -> list[list[str]]:
+    chunks: list[list[str]] = []
+    i = 0
+    n = len(tokens)
+
+    while i < n:
+        tok = tokens[i]
+        if tok in ["name=note_onset", "name=note_offset"]:
+            j = i + 1
+            while j < n:
+                if tokens[j] in ["name=note_onset", "name=note_offset"]:
+                    break
+                if tokens[j].startswith("time_index=") and j + 1 < n and tokens[j + 1] in ["name=note_onset", "name=note_offset"]:
+                    break
+                j += 1
+            chunks.append(tokens[i:j])
+            i = j
+            continue
+
+        if tok.startswith("time_index=") and i + 1 < n and tokens[i + 1] in ["name=note_onset", "name=note_offset"]:
+            j = i + 2
+            while j < n:
+                if tokens[j].startswith("time_index="):
+                    break
+                if tokens[j] in ["name=note_onset", "name=note_offset"]:
+                    break
+                j += 1
+            chunks.append(tokens[i:j])
+            i = j
+            continue
+
+        chunks.append([tok])
+        i += 1
+
+    return chunks
+
+
 def format_tokens_by_event(tokens: list[str], include_program: bool = False) -> str:
     """Pretty-print token list, one line per event.
 
@@ -133,44 +173,9 @@ def format_tokens_by_event(tokens: list[str], include_program: bool = False) -> 
     onset event len = 4 + program, offset event len = 3 + program
     """
     lines = []
-    i = 0
-    event_idx = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if "=" not in tok:
-            lines.append(f"  [{event_idx}] {tok}")
-            i += 1
-            event_idx += 1
-            continue
-
-        key, _ = tok.split("=", 1)
-        if key != "time_index":
-            lines.append(f"  [{event_idx}] {tok}")
-            i += 1
-            event_idx += 1
-            continue
-
-        if i + 1 >= len(tokens):
-            lines.append(f"  [{event_idx}] {tok}")
-            i += 1
-            event_idx += 1
-            continue
-
-        name_tok = tokens[i + 1]
-        if name_tok == "name=note_onset":
-            event_len = 4 + (1 if include_program else 0)
-        elif name_tok == "name=note_offset":
-            event_len = 3 + (1 if include_program else 0)
-        else:
-            lines.append(f"  [{event_idx}] {tok}")
-            i += 1
-            event_idx += 1
-            continue
-
-        chunk = tokens[i : i + event_len]
+    chunks = _extract_event_chunks(tokens)
+    for event_idx, chunk in enumerate(chunks):
         lines.append(f"  [{event_idx}] " + " | ".join(chunk))
-        i += event_len
-        event_idx += 1
 
     return "\n".join(lines)
 
@@ -186,58 +191,37 @@ def tokens_to_midi(
 ) -> None:
     """Convert generated token list to a MIDI file.
 
-    Expected token order per event (MIDI2Tokens construction order):
-        note_onset:  time_index=X, name=note_onset, (pitch|drum_pitch)=X, velocity=X [, program=X]
-        note_offset: time_index=X, name=note_offset, (pitch|drum_pitch)=X [, program=X]
+    Supported token order per event:
+        time_first: time_index=X, name=note_onset|note_offset, ...
+        name_first: name=note_onset|note_offset, time_index=X, ...
     """
     note_dict: dict[tuple[int, int], list[dict]] = {}
-    n = len(tokens)
-    i = 0
+    chunks = _extract_event_chunks(tokens)
 
-    while i < n:
-        tok = tokens[i]
-        if "=" not in tok:
-            i += 1
-            continue
+    for chunk in chunks:
+        name_tok = None
+        time_index = None
+        event: dict[str, int | str] = {}
 
-        key, value = tok.split("=", 1)
-        if key != "time_index":
-            i += 1
-            continue
-
-        if not value.isdigit():
-            i += 1
-            continue
-        time_index = int(value)
-        if i + 1 >= n:
-            break
-
-        name_tok = tokens[i + 1]
-        if name_tok not in ["name=note_onset", "name=note_offset"]:
-            i += 1
-            continue
-
-        j = i + 2
-        event: dict[str, int | str] = {"time_index": time_index}
-
-        while j < n:
-            if "=" not in tokens[j]:
-                break
-
-            k, v = tokens[j].split("=", 1)
-            if k == "time_index":
-                break
-            if tokens[j] in ["name=note_onset", "name=note_offset"]:
-                break
-
-            if k in ["pitch", "drum_pitch", "velocity", "program"]:
+        for tok in chunk:
+            if "=" not in tok:
+                continue
+            k, v = tok.split("=", 1)
+            if k == "name" and v in ["note_onset", "note_offset"]:
+                name_tok = "name={}".format(v)
+            elif k == "time_index" and v.isdigit():
+                time_index = int(v)
+            elif k in ["pitch", "drum_pitch", "velocity", "program"]:
                 event[k] = v
-            j += 1
+
+        if name_tok not in ["name=note_onset", "name=note_offset"]:
+            continue
+        if time_index is None:
+            continue
 
         is_onset = name_tok == "name=note_onset"
         pitch_key = "drum_pitch" if "drum_pitch" in event else "pitch"
         if pitch_key not in event:
-            i = j
             continue
         pitch = int(event[pitch_key])
         program = int(event["program"]) if "program" in event else (128 if pitch_key == "drum_pitch" else 0)
@@ -245,7 +229,6 @@ def tokens_to_midi(
 
         if is_onset:
             if "velocity" not in event:
-                i = j
                 continue
             velocity = int(event["velocity"])
             note = {
@@ -260,8 +243,6 @@ def tokens_to_midi(
         else:
             if key_pitch_program in note_dict and len(note_dict[key_pitch_program]) > 0:
                 note_dict[key_pitch_program][-1]["offset_time_index"] = time_index
-
-        i = j
 
     # Collect all notes
     midi_data = pretty_midi.PrettyMIDI()

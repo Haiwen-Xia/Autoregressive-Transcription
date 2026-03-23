@@ -1,9 +1,17 @@
 class MIDI2Tokens:
-    def __init__(self, fps: float, include_program: bool = True, drum_pitch: bool = False) -> None:
+    def __init__(
+        self,
+        fps: float,
+        include_program: bool = True,
+        drum_pitch: bool = False,
+        event_token_order: str = "time_first",
+    ) -> None:
         r"""Convert MIDI events to captions."""
         self.fps = fps
         self.include_program = include_program
         self.drum_pitch = drum_pitch
+        assert event_token_order in ["time_first", "name_first"]
+        self.event_token_order = event_token_order
 
     def __call__(self, data: dict) -> dict:
         r"""Convert data of MIDI events to tokens.
@@ -46,11 +54,16 @@ class MIDI2Tokens:
 
             elif (note.start < start_time) and (start_time <= note.end <= end_time):
                 
-                events.append([
-                    "time_index={}".format(round((note.end - start_time) * self.fps)),
-                    "name=note_offset",
-                    "{}={}".format(pitch_token_key, note.pitch)
-                ] + program_token)
+                events.append(
+                    self.build_event_tokens(
+                        time_index=round((note.end - start_time) * self.fps),
+                        name="note_offset",
+                        pitch_token_key=pitch_token_key,
+                        pitch=int(note.pitch),
+                        velocity=None,
+                        program_token=program_token,
+                    )
+                )
 
             elif (note.start < start_time) and (end_time < note.end):
                 pass
@@ -67,27 +80,40 @@ class MIDI2Tokens:
                 if offset_idx <= onset_idx:
                     offset_idx = onset_idx + 1
                 #* time_index applied first
-                events.append([
-                    "time_index={}".format(onset_idx),                    
-                    "name=note_onset",
-                    "{}={}".format(pitch_token_key, note.pitch),
-                    "velocity={}".format(note.velocity)
-                ] + program_token)
+                events.append(
+                    self.build_event_tokens(
+                        time_index=onset_idx,
+                        name="note_onset",
+                        pitch_token_key=pitch_token_key,
+                        pitch=int(note.pitch),
+                        velocity=int(note.velocity),
+                        program_token=program_token,
+                    )
+                )
 
-                events.append([
-                    "time_index={}".format(offset_idx),                    
-                    "name=note_offset",
-                    "{}={}".format(pitch_token_key, note.pitch),
-                ] + program_token)
+                events.append(
+                    self.build_event_tokens(
+                        time_index=offset_idx,
+                        name="note_offset",
+                        pitch_token_key=pitch_token_key,
+                        pitch=int(note.pitch),
+                        velocity=None,
+                        program_token=program_token,
+                    )
+                )
 
             elif (start_time <= note.start <= end_time) and (end_time < note.end):
 
-                events.append([
-                    "time_index={}".format(round((note.start - start_time) * self.fps)),
-                    "name=note_onset",
-                    "{}={}".format(pitch_token_key, note.pitch),
-                    "velocity={}".format(note.velocity)
-                ] + program_token)
+                events.append(
+                    self.build_event_tokens(
+                        time_index=round((note.start - start_time) * self.fps),
+                        name="note_onset",
+                        pitch_token_key=pitch_token_key,
+                        pitch=int(note.pitch),
+                        velocity=int(note.velocity),
+                        program_token=program_token,
+                    )
+                )
 
             elif end_time < note.start:
                 pass
@@ -158,6 +184,31 @@ class MIDI2Tokens:
         # E.g., "time_index=000056,name=00_note_offset,pitch=000044"
 
         return key, event
+
+    def build_event_tokens(
+        self,
+        time_index: int,
+        name: str,
+        pitch_token_key: str,
+        pitch: int,
+        velocity: None | int,
+        program_token: list[str],
+    ) -> list[str]:
+        assert name in ["note_onset", "note_offset"]
+
+        ordered_tokens: list[str] = []
+        if self.event_token_order == "time_first":
+            ordered_tokens.append("time_index={}".format(int(time_index)))
+            ordered_tokens.append("name={}".format(name))
+        else:
+            ordered_tokens.append("name={}".format(name))
+            ordered_tokens.append("time_index={}".format(int(time_index)))
+
+        ordered_tokens.append("{}={}".format(pitch_token_key, int(pitch)))
+        if velocity is not None:
+            ordered_tokens.append("velocity={}".format(int(velocity)))
+        ordered_tokens += program_token
+        return ordered_tokens
 
     def extend_token(self, token: str) -> str:
         r"""Left pad values for sorting."""

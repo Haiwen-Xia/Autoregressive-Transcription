@@ -1,7 +1,8 @@
 """Constrained decoder for MIDI token generation.
 
 Enforces token generation order per event (matching MIDI2Tokens construction order):
-    time_index -> name -> pitch -> velocity (onset only) -> program (optional)
+    time_first: time_index -> name -> pitch -> velocity (onset only) -> program (optional)
+    name_first: name -> time_index -> pitch -> velocity (onset only) -> program (optional)
 
 Tracks violations: how many top-k candidates fall outside the allowed set at each step.
 """
@@ -12,59 +13,79 @@ import torch
 class MidiConstrainedDecoder:
 
     # States
-    EXPECT_TIME_OR_SEP = 0  # start of a new event, or [SEP] to end
-    EXPECT_NAME = 1
+    EXPECT_START_OR_SEP = 0  # start of a new event, or [SEP] to end
+    EXPECT_SECOND = 1
     EXPECT_PITCH = 2
     EXPECT_VELOCITY = 3
     EXPECT_PROGRAM = 4
-    STATE_NAMES = ["EXPECT_TIME_OR_SEP", "EXPECT_NAME", "EXPECT_PITCH", "EXPECT_VELOCITY", "EXPECT_PROGRAM"]
+    STATE_NAMES = ["EXPECT_START_OR_SEP", "EXPECT_SECOND", "EXPECT_PITCH", "EXPECT_VELOCITY", "EXPECT_PROGRAM"]
 
-    def __init__(self, tokenizer, vocab_size: int, include_program: bool = False, device: str = "cuda"):
+    def __init__(
+        self,
+        tokenizer,
+        vocab_size: int,
+        include_program: bool = False,
+        token_order: str = "time_first",
+        device: str = "cuda",
+    ):
         """
         Args:
             tokenizer: BertMIDI tokenizer instance
             vocab_size: total vocabulary size
             include_program: whether program=X tokens are part of each event
+            token_order: one of ["time_first", "name_first"]
             device: torch device
         """
         self.include_program = include_program
         self.vocab_size = vocab_size
         self.device = device
+        assert token_order in ["time_first", "name_first"]
+        self.token_order = token_order
 
         tok = tokenizer.tok
         self.sep_id = tok.sep_token_id
         self.name_onset_id = tok.convert_tokens_to_ids("name=note_onset")
         self.name_offset_id = tok.convert_tokens_to_ids("name=note_offset")
 
-        # Precompute allowed-ID boolean masks for each state, shape: (5, vocab_size)
-        self.masks = torch.zeros(5, vocab_size, dtype=torch.bool, device=device)
+        # Precompute reusable masks.
+        self.mask_time_or_sep = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        self.mask_name_or_sep = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        self.mask_time_only = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        self.mask_name_only = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        self.mask_pitch_only = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        self.mask_velocity_only = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        self.mask_program_only = torch.zeros(vocab_size, dtype=torch.bool, device=device)
 
-        # EXPECT_TIME_OR_SEP: time_index=0..6000 or [SEP]
+        # time_index=0..6000
         time_start = tok.convert_tokens_to_ids("time_index=0")
-        self.masks[self.EXPECT_TIME_OR_SEP, time_start : time_start + 6001] = True
-        self.masks[self.EXPECT_TIME_OR_SEP, self.sep_id] = True
+        self.mask_time_or_sep[time_start : time_start + 6001] = True
+        self.mask_time_or_sep[self.sep_id] = True
+        self.mask_time_only[time_start : time_start + 6001] = True
 
-        # EXPECT_NAME: note_onset / note_offset
-        self.masks[self.EXPECT_NAME, self.name_onset_id] = True
-        self.masks[self.EXPECT_NAME, self.name_offset_id] = True
+        # name=note_onset / name=note_offset
+        self.mask_name_or_sep[self.name_onset_id] = True
+        self.mask_name_or_sep[self.name_offset_id] = True
+        self.mask_name_or_sep[self.sep_id] = True
+        self.mask_name_only[self.name_onset_id] = True
+        self.mask_name_only[self.name_offset_id] = True
 
-        # EXPECT_PITCH: pitch=0..127 plus optional drum_pitch=0..127
+        # pitch=0..127 plus optional drum_pitch=0..127
         pitch_start = tok.convert_tokens_to_ids("pitch=0")
-        self.masks[self.EXPECT_PITCH, pitch_start : pitch_start + 128] = True
+        self.mask_pitch_only[pitch_start : pitch_start + 128] = True
         drum_pitch_start = tok.convert_tokens_to_ids("drum_pitch=0")
         if drum_pitch_start != tok.unk_token_id:
-            self.masks[self.EXPECT_PITCH, drum_pitch_start : drum_pitch_start + 128] = True
+            self.mask_pitch_only[drum_pitch_start : drum_pitch_start + 128] = True
 
-        # EXPECT_VELOCITY: velocity=0..127
+        # velocity=0..127
         vel_start = tok.convert_tokens_to_ids("velocity=0")
-        self.masks[self.EXPECT_VELOCITY, vel_start : vel_start + 128] = True
+        self.mask_velocity_only[vel_start : vel_start + 128] = True
 
-        # EXPECT_PROGRAM: program=0..127
+        # program=0..128
         prog_start = tok.convert_tokens_to_ids("program=0")
-        self.masks[self.EXPECT_PROGRAM, prog_start : prog_start + 129] = True
+        self.mask_program_only[prog_start : prog_start + 129] = True
 
         # Runtime state
-        self.state = self.EXPECT_TIME_OR_SEP
+        self.state = self.EXPECT_START_OR_SEP
         self.current_name_id = None
         self.violations = 0
         self.total_topk_candidates = 0
@@ -72,7 +93,21 @@ class MidiConstrainedDecoder:
     # ------------------------------------------------------------------
     def get_allowed_mask(self) -> torch.Tensor:
         """Boolean mask of shape (vocab_size,) for current state."""
-        return self.masks[self.state]
+        if self.state == self.EXPECT_START_OR_SEP:
+            if self.token_order == "time_first":
+                return self.mask_time_or_sep
+            return self.mask_name_or_sep
+        if self.state == self.EXPECT_SECOND:
+            if self.token_order == "time_first":
+                return self.mask_name_only
+            return self.mask_time_only
+        if self.state == self.EXPECT_PITCH:
+            return self.mask_pitch_only
+        if self.state == self.EXPECT_VELOCITY:
+            return self.mask_velocity_only
+        if self.state == self.EXPECT_PROGRAM:
+            return self.mask_program_only
+        raise ValueError(self.state)
 
     def count_violations(self, topk_ids: torch.Tensor) -> None:
         """Count how many top-k candidates violate the current constraint.
@@ -80,7 +115,7 @@ class MidiConstrainedDecoder:
         Args:
             topk_ids: (k,) or (b, k) tensor of token IDs
         """
-        allowed = self.masks[self.state]  # (vocab_size,)
+        allowed = self.get_allowed_mask()  # (vocab_size,)
         flat = topk_ids.reshape(-1)
         n = flat.shape[0]
         self.total_topk_candidates += n
@@ -93,14 +128,21 @@ class MidiConstrainedDecoder:
             True  -> keep generating
             False -> stop (SEP was generated)
         """
-        if self.state == self.EXPECT_TIME_OR_SEP:
+        if self.state == self.EXPECT_START_OR_SEP:
             if token_id == self.sep_id:
                 return False  # end of sequence
-            self.state = self.EXPECT_NAME
+            if self.token_order == "time_first":
+                self.state = self.EXPECT_SECOND
+            else:
+                # name_first: first token is name.
+                self.current_name_id = token_id
+                self.state = self.EXPECT_SECOND
 
-        elif self.state == self.EXPECT_NAME:
-            # got name=note_onset or name=note_offset
-            self.current_name_id = token_id
+        elif self.state == self.EXPECT_SECOND:
+            if self.token_order == "time_first":
+                # time_first: second token is name.
+                self.current_name_id = token_id
+            # name_first: second token is time_index.
             self.state = self.EXPECT_PITCH
 
         elif self.state == self.EXPECT_PITCH:
@@ -111,21 +153,21 @@ class MidiConstrainedDecoder:
                 if self.include_program:
                     self.state = self.EXPECT_PROGRAM
                 else:
-                    self.state = self.EXPECT_TIME_OR_SEP
+                    self.state = self.EXPECT_START_OR_SEP
 
         elif self.state == self.EXPECT_VELOCITY:
             if self.include_program:
                 self.state = self.EXPECT_PROGRAM
             else:
-                self.state = self.EXPECT_TIME_OR_SEP
+                self.state = self.EXPECT_START_OR_SEP
 
         elif self.state == self.EXPECT_PROGRAM:
-            self.state = self.EXPECT_TIME_OR_SEP
+            self.state = self.EXPECT_START_OR_SEP
 
         return True
 
     def reset(self) -> None:
-        self.state = self.EXPECT_TIME_OR_SEP
+        self.state = self.EXPECT_START_OR_SEP
         self.current_name_id = None
         self.violations = 0
         self.total_topk_candidates = 0
