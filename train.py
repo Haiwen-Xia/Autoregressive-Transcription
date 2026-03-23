@@ -247,7 +247,7 @@ def main_func(cfg: DictConfig) -> None:
                     payload["grad_norm"] = grad_norm_value
                 wandb.log(data=payload, step=global_step)
 
-        if global_step % configs["train"]["test_every_n_steps"] == 500:
+        if global_step % configs["train"]["test_every_n_steps"] == 0:
             train_loss = validate(
                 configs=configs,
                 dataset=train_dataset,
