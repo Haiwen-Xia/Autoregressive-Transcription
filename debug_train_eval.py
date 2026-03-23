@@ -480,6 +480,8 @@ def main_func(cfg: DictConfig) -> None:
         audio_latent_dim=int(getattr(cast(Any, audio_encoder), "latent_dim")),
         vocab_size=len(cast(Any, tokenizer)),
         ckpt_path=resume_ckpt_path,
+        audio_encoder=audio_encoder,
+        tokenizer=tokenizer,
     ).to(device)
 
     inference_fn = _make_inference_fn(
