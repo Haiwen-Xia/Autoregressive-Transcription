@@ -1,0 +1,56 @@
+[
+  {
+    "timestamp": "2026-04-03T23:16:18",
+    "program_id": 0,
+    "program_name": "0_Acoustic Grand Piano",
+    "vst_path": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/Rendering_source/pianoteq_trial_v912/Pianoteq 9/x86-64bit/Pianoteq 9.vst3",
+    "program_name_duplicate": "0_Acoustic Grand Piano",
+    "output_dir": "test_rendering/0_Acoustic_Grand_Piano/Pianoteq_9.vst3",
+    "metadata_file": "test_rendering/0_Acoustic_Grand_Piano/Pianoteq_9.vst3/metadata.json"
+  },
+  {
+    "timestamp": "2026-04-05T10:01:46",
+    "program_id": 0,
+    "program_name": "0_Acoustic Grand Piano",
+    "vst_path": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/Rendering_source/pianoteq_trial_v912/Pianoteq 9/x86-64bit/Pianoteq 9.vst3",
+    "program_name_duplicate": "0_Acoustic Grand Piano",
+    "output_dir": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3",
+    "metadata_file": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3/metadata.json"
+  },
+  {
+    "timestamp": "2026-04-05T10:04:45",
+    "program_id": 0,
+    "program_name": "0_Acoustic Grand Piano",
+    "vst_path": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/Rendering_source/pianoteq_trial_v912/Pianoteq_9/x86-64bit/Pianoteq 9.vst3",
+    "program_name_duplicate": "0_Acoustic Grand Piano",
+    "output_dir": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3",
+    "metadata_file": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3/metadata.json"
+  },
+  {
+    "timestamp": "2026-04-05T10:10:22",
+    "program_id": 0,
+    "program_name": "0_Acoustic Grand Piano",
+    "vst_path": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/Rendering_source/pianoteq_trial_v912/Pianoteq_9/x86-64bit/Pianoteq 9.vst3",
+    "program_name_duplicate": "0_Acoustic Grand Piano",
+    "output_dir": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3",
+    "metadata_file": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3/metadata.json"
+  },
+  {
+    "timestamp": "2026-04-05T10:37:10",
+    "program_id": 0,
+    "program_name": "0_Acoustic Grand Piano",
+    "vst_path": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/Rendering_source/pianoteq_trial_v912/Pianoteq 9/x86-64bit/Pianoteq 9.vst3",
+    "program_name_duplicate": "0_Acoustic Grand Piano",
+    "output_dir": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3",
+    "metadata_file": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3/metadata.json"
+  },
+  {
+    "timestamp": "2026-04-05T11:15:15",
+    "program_id": 0,
+    "program_name": "0_Acoustic Grand Piano",
+    "vst_path": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/Rendering_source/pianoteq_trial_v912/Pianoteq 9/x86-64bit/Pianoteq 9.vst3",
+    "program_name_duplicate": "0_Acoustic Grand Piano",
+    "output_dir": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3",
+    "metadata_file": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3/metadata.json"
+  }
+]

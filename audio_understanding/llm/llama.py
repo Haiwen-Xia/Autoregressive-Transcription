@@ -27,8 +27,6 @@ class LlamaConfig:
     n_head: int = 32
     n_embd: int = 4096
     rope_mode: str = "ordinary"
-    time_rope_mix_weight: float = 0.5
-    time_rope_use_linear: bool = False
     time_rope_audio_fps: float = 100.0
     time_rope_token_fps: float = 100.0
     time_rope_alpha: None | float = None
@@ -60,7 +58,6 @@ class Llama(nn.Module):
             "time_aware",
             "time_aware_2d",
         ]
-        assert 0.0 <= self.config.time_rope_mix_weight <= 1.0
         if self.config.time_rope_alpha is None:
             self.config.time_rope_alpha = float(self.config.time_rope_audio_fps)
         assert self.config.time_rope_alpha > 0
@@ -84,8 +81,6 @@ class Llama(nn.Module):
             seq_len=config.block_size,
             head_dim=config.n_embd // config.n_head,
             mode=config.rope_mode,
-            mix_weight=config.time_rope_mix_weight,
-            use_linear=config.time_rope_use_linear,
         )
 
     def _init_weights(self, module: nn.Module) -> None:

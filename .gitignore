@@ -7,3 +7,6 @@ slakh/
 outputs/
 
 *.log
+*.mp3
+*.wav
+*.mid

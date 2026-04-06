@@ -19,8 +19,6 @@ class RotaryEmbedding(nn.Module):
         seq_len: int,
         head_dim: int,
         mode: str = "ordinary",
-        mix_weight: float = 0.5,
-        use_linear: bool = False,
         base: int = 10000,
     ) -> None:
         super().__init__()
@@ -29,14 +27,10 @@ class RotaryEmbedding(nn.Module):
             "time_aware_2d": "2d",
         }
         mode = mode_alias.get(mode, mode)
-        if mode == "1d" and use_linear:
-            mode = "1d_linear"
 
         assert mode in ["ordinary", "1d", "1d_linear", "2d"]
-        assert 0.0 <= mix_weight <= 1.0
 
         self.mode = mode
-        self.mix_weight = mix_weight
         self.base = base
         self.head_dim = head_dim
 
@@ -60,34 +54,11 @@ class RotaryEmbedding(nn.Module):
         if self.mode == "ordinary":
             return apply_rope(
                 x=x,
-                rope_cache=self.rope_cache,
+                rope_cache=self.rope_cache, #* buffer registered in __init__
                 rope_apply_mask=rope_apply_mask,
             )
 
         assert time_coords is not None
-
-        if self.mode == "1d":
-            x_pos = apply_rope(
-                x=x,
-                rope_cache=self.rope_cache,
-                rope_apply_mask=rope_apply_mask,
-            )
-            x_time = apply_rope_with_coords(x=x, coords=time_coords, base=self.base)
-            x_mix = self.mix_weight * x_pos + (1.0 - self.mix_weight) * x_time
-
-            if rope_apply_mask is None:
-                return x_mix.type_as(x)
-
-            t = x.shape[1]
-            mask = rope_apply_mask[:t].view(1, t, 1, 1)
-            return torch.where(mask, x_mix, x_pos).type_as(x)
-
-        if self.mode == "1d_linear":
-            t = x.shape[1]
-            pos_coords = torch.arange(t, device=time_coords.device, dtype=torch.float32).unsqueeze(0)
-            mixed_coords = (1.0 - self.mix_weight) * time_coords[:, :t] + self.mix_weight * pos_coords
-            x_rot = apply_rope_with_coords(x=x, coords=mixed_coords, base=self.base)
-            return _apply_rotation_mask(x_orig=x, x_rot=x_rot, rope_apply_mask=rope_apply_mask)
 
         assert self.mode == "2d"
         x_rot = apply_rope_2d(
