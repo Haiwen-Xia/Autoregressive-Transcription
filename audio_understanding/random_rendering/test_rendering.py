@@ -14,6 +14,24 @@ DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_BUFFER_SIZE = 128
 
 
+def load_plugin_state_or_preset(
+    synth,
+    preset_path: str | None,
+    state_path: str | None,
+) -> None:
+    if state_path is not None:
+        synth.load_state(state_path)
+
+    if preset_path is None:
+        return
+
+    if preset_path.endswith(".vstpreset"):
+        synth.load_vst3_preset(preset_path)
+        return
+
+    synth.load_preset(preset_path)
+
+
 def sanitize_name(value: str) -> str:
     """Make a filesystem-safe directory name."""
     cleaned = re.sub(r"[<>:\"/\\|?*]", "_", value.strip())
@@ -64,7 +82,13 @@ def save_audio_mp3(audio: np.ndarray, sample_rate: int, out_mp3_path: Path) -> s
             )
 
 
-def build_engine_and_synth(vst_path: str, sample_rate: int, buffer_size: int):
+def build_engine_and_synth(
+    vst_path: str,
+    sample_rate: int,
+    buffer_size: int,
+    preset_path: str | None = None,
+    state_path: str | None = None,
+):
     """Build engine, suppressing the harmless URI warning JUCE emits for paths with spaces."""
     import os
 
@@ -80,13 +104,22 @@ def build_engine_and_synth(vst_path: str, sample_rate: int, buffer_size: int):
         os.dup2(saved_stderr_fd, 2)
         os.close(saved_stderr_fd)
 
+    load_plugin_state_or_preset(synth, preset_path, state_path)
     engine.load_graph([(synth, [])])
     return engine, synth
 
 
-def render_single_note_scale(vst_path: str, sample_rate: int, buffer_size: int) -> np.ndarray:
+def render_single_note_scale(
+    vst_path: str,
+    sample_rate: int,
+    buffer_size: int,
+    preset_path: str | None = None,
+    state_path: str | None = None,
+) -> np.ndarray:
     """Render a simple ascending single-note scale."""
-    engine, synth = build_engine_and_synth(vst_path, sample_rate, buffer_size)
+    engine, synth = build_engine_and_synth(
+        vst_path, sample_rate, buffer_size, preset_path, state_path
+    )
 
     notes = range(60, 84)
     start = 0.0
@@ -104,9 +137,17 @@ def render_single_note_scale(vst_path: str, sample_rate: int, buffer_size: int) 
 
     return audio
 
-def render_consecutive(vst_path: str, sample_rate: int, buffer_size: int) -> np.ndarray:
+def render_consecutive(
+    vst_path: str,
+    sample_rate: int,
+    buffer_size: int,
+    preset_path: str | None = None,
+    state_path: str | None = None,
+) -> np.ndarray:
     """Render a simple ascending single-note scale."""
-    engine, synth = build_engine_and_synth(vst_path, sample_rate, buffer_size)
+    engine, synth = build_engine_and_synth(
+        vst_path, sample_rate, buffer_size, preset_path, state_path
+    )
 
     notes = [60]*10
     start = 0.0
@@ -121,9 +162,17 @@ def render_consecutive(vst_path: str, sample_rate: int, buffer_size: int) -> np.
     total_seconds = start + dur
     engine.render(total_seconds)
     return engine.get_audio()
-def render_continuous_chords(vst_path: str, sample_rate: int, buffer_size: int) -> np.ndarray:
+def render_continuous_chords(
+    vst_path: str,
+    sample_rate: int,
+    buffer_size: int,
+    preset_path: str | None = None,
+    state_path: str | None = None,
+) -> np.ndarray:
     """Render a continuous chord progression."""
-    engine, synth = build_engine_and_synth(vst_path, sample_rate, buffer_size)
+    engine, synth = build_engine_and_synth(
+        vst_path, sample_rate, buffer_size, preset_path, state_path
+    )
 
     chords = [
         [60, 64, 67],  # C
@@ -149,6 +198,8 @@ def render_fugue_polyphony(
     midi_path: Path,
     sample_rate: int,
     buffer_size: int,
+    preset_path: str | None = None,
+    state_path: str | None = None,
     start_sec: float = 15.0,
     end_sec: float = 25.0,
 ) -> np.ndarray:
@@ -164,7 +215,9 @@ def render_fugue_polyphony(
         if not instrument.notes:
             continue
 
-        engine, synth = build_engine_and_synth(vst_path, sample_rate, buffer_size)
+        engine, synth = build_engine_and_synth(
+            vst_path, sample_rate, buffer_size, preset_path, state_path
+        )
 
         for note in instrument.notes:
             note_start = max(float(note.start), start_sec)
@@ -221,6 +274,8 @@ def run_render_pipeline(
     global_json_path: Path,
     sample_rate: int,
     buffer_size: int,
+    preset_path: str | None = None,
+    state_path: str | None = None,
 ) -> None:
     program_name = f"{program_id}_" + standard_midi_program_name(program_id)
     program_dir = sanitize_name(program_name)
@@ -230,19 +285,32 @@ def run_render_pipeline(
 
     now_iso = datetime.now().isoformat(timespec="seconds")
 
-    consecutive = render_consecutive(vst_path, sample_rate, buffer_size)
+    consecutive = render_consecutive(
+        vst_path, sample_rate, buffer_size, preset_path, state_path
+    )
     consecutive_mp3 = out_dir / "consecutive.mp3"
     consecutive_backend = save_audio_mp3(consecutive, sample_rate, consecutive_mp3)
     
-    single_audio = render_single_note_scale(vst_path, sample_rate, buffer_size)
+    single_audio = render_single_note_scale(
+        vst_path, sample_rate, buffer_size, preset_path, state_path
+    )
     single_mp3 = out_dir / "single_note_scale.mp3"
     single_backend = save_audio_mp3(single_audio, sample_rate, single_mp3)
 
-    chords_audio = render_continuous_chords(vst_path, sample_rate, buffer_size)
+    chords_audio = render_continuous_chords(
+        vst_path, sample_rate, buffer_size, preset_path, state_path
+    )
     chords_mp3 = out_dir / "continuous_chords.mp3"
     chords_backend = save_audio_mp3(chords_audio, sample_rate, chords_mp3)
 
-    fugue_audio = render_fugue_polyphony(vst_path, midi_path, sample_rate, buffer_size)
+    fugue_audio = render_fugue_polyphony(
+        vst_path,
+        midi_path,
+        sample_rate,
+        buffer_size,
+        preset_path,
+        state_path,
+    )
     fugue_mp3 = out_dir / "fugue_polyphony.mp3"
     fugue_backend = save_audio_mp3(fugue_audio, sample_rate, fugue_mp3)
 
@@ -269,6 +337,8 @@ def run_render_pipeline(
         "sample_rate": sample_rate,
         "buffer_size": buffer_size,
         "midi_path": str(midi_path),
+        "preset_path": preset_path,
+        "state_path": state_path,
         "midi_track_programs": track_programs,
         "fugue_window_seconds": {
             "start": 15.0,
@@ -349,6 +419,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
     parser.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER_SIZE)
+    parser.add_argument(
+        "--preset-path",
+        default=None,
+        help="Optional plugin preset path (.fxp or .vstpreset)",
+    )
+    parser.add_argument(
+        "--state-path",
+        default=None,
+        help="Optional DawDreamer plugin state path",
+    )
     return parser.parse_args()
 
 
@@ -367,6 +447,8 @@ def main() -> None:
         global_json_path=Path(args.global_json),
         sample_rate=args.sample_rate,
         buffer_size=args.buffer_size,
+        preset_path=args.preset_path,
+        state_path=args.state_path,
     )
 
 

@@ -296,6 +296,33 @@ class UniformSampler(BaseSampler):
         return notes
 
 
+class ChordSampler(BaseSampler):
+    """
+    和弦采样器：所有音符从0s开始，持续1s，pitch从[21,108]不重复随机采样，velocity固定为50。
+    输入 note_num_dis: {"values": [...], "probs": [...]}，用于采样和弦音符数量。
+    """
+    def __init__(self, note_num_dis: Dict[str, Any]):
+        super().__init__(time=1.0)
+        values = np.asarray(note_num_dis["values"])
+        probs = np.asarray(note_num_dis.get("probs", [1.0/len(values)]*len(values)), dtype=np.float64)
+        probs = probs / probs.sum()
+        self.note_num_dis = {"values": values, "probs": probs}
+
+    def sample(self, seed: int = None) -> List[Dict[str, Any]]:
+        if seed is not None:
+            super().sample(seed)
+        number = int(np.random.choice(self.note_num_dis["values"], p=self.note_num_dis["probs"]))
+        if number == 0:
+            return []
+        assert number <= 88, f"number of notes {number} exceeds available pitches (88)"
+        pitches = np.random.choice(np.arange(21, 109), size=number, replace=False)
+        notes = [
+            {"pitch": int(p), "start": 0.0, "dur": 1.0, "velocity": 50, "program": 0}
+            for p in pitches
+        ]
+        return notes
+
+
 if __name__ == "__main__":
     import os
 #* todo: 一个特别随机的version

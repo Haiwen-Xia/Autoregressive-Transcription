@@ -52,5 +52,23 @@
     "program_name_duplicate": "0_Acoustic Grand Piano",
     "output_dir": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3",
     "metadata_file": "0_Acoustic_Grand_Piano/Pianoteq_9.vst3/metadata.json"
+  },
+  {
+    "timestamp": "2026-04-14T23:49:48",
+    "program_id": 24,
+    "program_name": "24_Acoustic Guitar (nylon)",
+    "vst_path": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/Rendering_source/Proteus-Linux-x64-1.2/usr/local/lib/vst3/Proteus.vst3",
+    "program_name_duplicate": "24_Acoustic Guitar (nylon)",
+    "output_dir": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/debug_rendering/proteus_test/24_Acoustic_Guitar_(nylon)/Proteus.vst3",
+    "metadata_file": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/debug_rendering/proteus_test/24_Acoustic_Guitar_(nylon)/Proteus.vst3/metadata.json"
+  },
+  {
+    "timestamp": "2026-04-15T00:35:53",
+    "program_id": 24,
+    "program_name": "24_Acoustic Guitar (nylon)",
+    "vst_path": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/Rendering_source/surge_xt/surge_plugins/Surge XT.vst3",
+    "program_name_duplicate": "24_Acoustic Guitar (nylon)",
+    "output_dir": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/debug_rendering/surge_guitar_test/24_Acoustic_Guitar_(nylon)/Surge_XT.vst3",
+    "metadata_file": "/data/yrb/musicarena/Haiwen/Autoregressive-Transcription/debug_rendering/surge_guitar_test/24_Acoustic_Guitar_(nylon)/Surge_XT.vst3/metadata.json"
   }
 ]

@@ -276,6 +276,7 @@ def batch_evaluate(
     epochs: int = 1,
     skip_empty_ref_for_averaging: bool = True,
     verbose: bool = True,
+    return_per_sample: bool = False,
 ) -> dict:
     r"""Run inference and evaluation over every sample in *dataset*.
 
@@ -388,5 +389,12 @@ def batch_evaluate(
 
     if "per_instrument" in result_acc:
         summary["instrument_summary"] = instrument_summary(result_acc["per_instrument"])
+
+    if return_per_sample:
+        per_sample = {
+            "onset_f1": [r["f1"] for r in result_acc.get("note_onset", [])],
+            "offset_f1": [r["f1"] for r in result_acc.get("note_offset", [])],
+        }
+        return summary, per_sample
 
     return summary

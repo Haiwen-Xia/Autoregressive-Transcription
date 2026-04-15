@@ -327,6 +327,172 @@ class OnlineRenderingBuffer:
         }
 
 
+# ---- helpers for MaestroRenderingBuffer ----
+
+def _load_maestro_metadata(maestro_root: str, split: str = "train") -> List[Dict]:
+    """Load MAESTRO CSV and return list of {midi_path, duration} for given split."""
+    import csv
+    from pathlib import Path
+    root = Path(maestro_root)
+    csv_path = root / "maestro-v3.0.0.csv"
+    assert csv_path.exists(), f"MAESTRO CSV not found: {csv_path}"
+    pieces = []
+    with open(csv_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["split"] != split:
+                continue
+            pieces.append({
+                "midi_path": str(root / row["midi_filename"]),
+                "duration": float(row["duration"]),
+            })
+    return pieces
+
+
+def _clip_midi_to_note_dicts(
+    midi_path: str,
+    start_time: float,
+    clip_duration: float,
+) -> List[Dict]:
+    """Read MIDI with symusic, clip to [start_time, start_time+clip_duration], return note dicts."""
+    from symusic import Score
+    score = Score(midi_path, ttype="second")
+    from audio_understanding.utils_midi_symusic import clip_symusic_notes
+
+    note_dicts = []
+    for track in score.tracks:
+        is_drum = bool(getattr(track, "is_drum", False))
+        program = 128 if is_drum else int(track.program)
+
+        clipped_notes, _ = clip_symusic_notes(
+            notes=list(track.notes),
+            start_time=start_time,
+            duration=clip_duration,
+            mode="clip",
+        )
+        for note in clipped_notes:
+            note_dicts.append({
+                "start": float(note.time) - start_time,
+                "dur": float(note.duration),
+                "pitch": int(note.pitch),
+                "velocity": int(note.velocity),
+                "program": program,
+            })
+    return note_dicts
+
+
+# module-level worker for MaestroRenderingBuffer spawn pool
+def _render_single_maestro(args):
+    """Worker: clip MIDI → render → tokenize. Runs in spawn pool."""
+    midi_path, start_time, clip_duration = args
+    note_dicts = _clip_midi_to_note_dicts(midi_path, start_time, clip_duration)
+    audio = _mp_ctx["engine"].render_notes(note_dicts, time=clip_duration)
+    tokens = _mp_ctx["token_fn"](note_dicts)
+    return audio, tokens
+
+
+class MaestroRenderingBuffer:
+    """Online rendering buffer that clips real MIDI from MAESTRO and renders with VST.
+
+    Same interface as OnlineRenderingBuffer (render_epoch + iterate_epoch),
+    so training loops can be swapped with zero code changes.
+    """
+
+    def __init__(
+        self,
+        maestro_root: str,
+        render_engine: "RenderEngine",
+        clip_duration: float,
+        token_fn: Callable[[List[Dict]], List[str]],
+        engine_spec: Optional[dict] = None,
+        token_fn_kwargs: Optional[dict] = None,
+        split: str = "train",
+    ):
+        self.render_engine = render_engine
+        self.clip_duration = clip_duration
+        self.token_fn = token_fn
+        self.engine_spec = engine_spec
+        self.token_fn_kwargs = token_fn_kwargs
+        self.epoch: List[Dict[str, Any]] = []
+
+        self.pieces = _load_maestro_metadata(maestro_root, split=split)
+        # filter out pieces shorter than clip_duration
+        orig_len = len(self.pieces)
+        self.pieces = [p for p in self.pieces if p["duration"] >= clip_duration]
+        if len(self.pieces) < orig_len:
+            import logging
+            logging.getLogger(__name__).info(
+                "MaestroRenderingBuffer: dropped %d pieces shorter than %.1fs, %d remain",
+                orig_len - len(self.pieces), clip_duration, len(self.pieces),
+            )
+        assert len(self.pieces) > 0, "No MAESTRO pieces long enough for clip_duration"
+
+    def __len__(self) -> int:
+        return len(self.epoch)
+
+    def render_epoch(
+        self, epoch_size: int, seed: Optional[int] = None, num_workers: int = 0,
+    ):
+        """Sample piece indices → random clip → render → tokenize."""
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+
+        # sample piece indices (with replacement)
+        piece_indices = [random.randrange(len(self.pieces)) for _ in range(epoch_size)]
+        questions = [random.choice(TRANSCRIPTION_QUESTIONS) for _ in range(epoch_size)]
+
+        # compute (midi_path, start_time) for each sample
+        render_args = []
+        for idx in piece_indices:
+            p = self.pieces[idx]
+            max_start = p["duration"] - self.clip_duration
+            start_time = random.uniform(0, max_start)
+            start_time = round(start_time / 0.01) * 0.01  # snap to 10ms grid
+            render_args.append((p["midi_path"], start_time, self.clip_duration))
+
+        # render + tokenize
+        if num_workers > 0:
+            assert self.engine_spec is not None and self.token_fn_kwargs is not None
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(
+                num_workers,
+                initializer=_spawn_worker_init,
+                initargs=(self.engine_spec, self.token_fn_kwargs),
+            ) as pool:
+                results = pool.map(_render_single_maestro, render_args)
+        else:
+            results = []
+            for midi_path, start_time, dur in render_args:
+                note_dicts = _clip_midi_to_note_dicts(midi_path, start_time, dur)
+                audio = self.render_engine.render_notes(note_dicts, time=dur)
+                tokens = self.token_fn(note_dicts)
+                results.append((audio, tokens))
+
+        self.epoch = []
+        for (audio, tokens), question in zip(results, questions):
+            self.epoch.append({
+                "dataset_name": "MaestroRendering",
+                "audio": audio[np.newaxis, :],   # (1, T)
+                "question": question,
+                "token": tokens,
+            })
+
+    def iterate_epoch(self, batch_size: int, repeat: int = 1):
+        """Yield batches — identical to OnlineRenderingBuffer.iterate_epoch."""
+        assert len(self.epoch) > 0, "call render_epoch first"
+        indices = list(range(len(self.epoch)))
+        for _ in range(repeat):
+            random.shuffle(indices)
+            for start in range(0, len(indices) - batch_size + 1, batch_size):
+                batch_idx = indices[start:start + batch_size]
+                yield OnlineRenderingBuffer._collate([self.epoch[i] for i in batch_idx])
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        assert len(self.epoch) > 0, "call render_epoch first"
+        return self.epoch[idx]
+
+
 def notes_to_piano_roll(
     notes: List[Dict],
     fps: float,

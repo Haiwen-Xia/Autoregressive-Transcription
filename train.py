@@ -740,7 +740,7 @@ def get_audio_encoder(configs: dict, ckpt_path: str) -> nn.Module:
         filtered_ckpt = {k: v for k, v in ckpt.items() if k in model_state and k not in skipped_shape}
         model.load_state_dict(filtered_ckpt, strict=False) #* there is no state dict key for audio encoder key 
         logging.info("Loaded audio encoder weights from %s", configs["audio_encoder"]["ckpt_path"])
-        
+        print(f"Loaded audio encoder checkpoint from {configs['audio_encoder']['ckpt_path']} with {len(filtered_ckpt)} matching keys, {len(skipped_shape)} skipped keys, {len(unexpected)} unexpected keys, {len(missing)} missing keys.")
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location="cpu")
         if "audio_encoder" in ckpt:
@@ -1026,7 +1026,6 @@ def get_llm(
             rope_mode=rope_mode,
             time_rope_audio_fps=time_rope_audio_fps,
             time_rope_token_fps=time_rope_token_fps,
-            time_rope_alpha=time_rope_alpha,
             id_to_token=id_to_token,
         )
         model = Llama(config=config)
