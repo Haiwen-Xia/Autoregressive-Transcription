@@ -304,7 +304,31 @@ class Sampler:
             np.clip(out, -1.0, 1.0, out=out)
 
         return out
-def build_engine_and_synth(vst_path: str, sample_rate: int, buffer_size: int):
+def load_plugin_state_or_preset(
+    synth,
+    preset_path: Optional[str] = None,
+    state_path: Optional[str] = None,
+):
+    if state_path is not None:
+        synth.load_state(state_path)
+
+    if preset_path is None:
+        return
+
+    if preset_path.endswith(".vstpreset"):
+        synth.load_vst3_preset(preset_path)
+        return
+
+    synth.load_preset(preset_path)
+
+
+def build_engine_and_synth(
+    vst_path: str,
+    sample_rate: int,
+    buffer_size: int,
+    preset_path: Optional[str] = None,
+    state_path: Optional[str] = None,
+):
     """Create a dawdreamer RenderEngine and load a VST plugin.
 
     Returns (engine, synth) ready for rendering. Calling code is responsible
@@ -330,6 +354,7 @@ def build_engine_and_synth(vst_path: str, sample_rate: int, buffer_size: int):
         os.dup2(saved_stderr_fd, 2)
         os.close(saved_stderr_fd)
 
+    load_plugin_state_or_preset(synth, preset_path, state_path)
     engine.load_graph([(synth, [])])
     return engine, synth
 
@@ -344,12 +369,124 @@ class DawDreamerSampler:
     as the pool initializer so each forked worker creates a fresh engine.
     """
 
-    def __init__(self, time: float, sr: int, vst_path: str, buffer_size: int = 512):
+    def __init__(
+        self,
+        time: float,
+        sr: int,
+        vst_path: str,
+        buffer_size: int = 512,
+        preset_path: Optional[str] = None,
+        state_path: Optional[str] = None,
+    ):
         self.time = float(time)
         self.sr = int(sr)
         self.vst_path = vst_path
         self.buffer_size = int(buffer_size)
-        self.engine, self.synth = build_engine_and_synth(vst_path, sr, buffer_size)
+        self.engine, self.synth = build_engine_and_synth(
+            vst_path,
+            sr,
+            buffer_size,
+            preset_path=preset_path,
+            state_path=state_path,
+        )
+        self._n_params: Optional[int] = None  # lazily cached
+
+        # Pianoteq continuously monitors its own files and prints
+        # "auto_reload_after_external_changes" to C-level stderr after every
+        # preset scan.  Permanently redirect fd 2 → /dev/null to silence it;
+        # Python-level sys.stderr is unaffected.
+        _devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_devnull, 2)
+        os.close(_devnull)
+
+    def _get_n_params(self) -> int:
+        if self._n_params is None:
+            self._n_params = len(self.synth.get_parameters_description())
+        return self._n_params
+
+    def randomize_parameters(
+        self,
+        num_params: Optional[int] = None,
+        param_indices: Optional[List[int]] = None,
+        skip_indices: Optional[List[int]] = None,
+        rng: Optional[np.random.Generator] = None,
+        search_steps: int = 100,
+    ) -> dict:
+        """Randomly set VST parameters, respecting each parameter's valid range.
+
+        Uses synth.get_parameter_range() to discover whether each parameter is
+        discrete (e.g. a boolean switch) or continuous, then samples accordingly:
+          - Discrete params  (few distinct keys)  → pick one of the valid keys.
+          - Continuous params (many keys / single range) → uniform in discovered bounds.
+
+        get_parameter_range returns a dict whose keys are the valid VST [0,1]
+        float values (individual floats for discrete params, or a dense set for
+        continuous params). set_parameter always takes a [0,1] float.
+
+        Args:
+            num_params:    How many randomly-chosen parameters to randomize.
+                           Ignored when param_indices is given.
+                           If None, randomizes all parameters.
+            param_indices: Explicit list of parameter indices to randomize.
+            skip_indices:  Parameter indices to leave untouched (e.g. Volume).
+            rng:           numpy Generator for reproducibility.
+            search_steps:  Steps passed to get_parameter_range for discovery.
+
+        Returns:
+            {index: value} dict of what was set.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        skip_set = set(skip_indices) if skip_indices else set()
+        n_total = self._get_n_params()
+
+        if param_indices is not None:
+            indices = [i for i in param_indices if i not in skip_set]
+        elif num_params is None:
+            indices = [i for i in range(n_total) if i not in skip_set]
+        else:
+            pool = [i for i in range(n_total) if i not in skip_set]
+            indices = rng.choice(pool, size=min(num_params, len(pool)), replace=False).tolist()
+
+        set_map = {}
+        for idx in indices:
+            idx = int(idx)
+            par_range = self.synth.get_parameter_range(idx, search_steps=search_steps, convert=True)
+            keys = list(par_range.keys())
+
+            # Keys may be plain floats (discrete) or (lo, hi) tuples (range).
+            if len(keys) == 0:
+                val = float(rng.random())
+            elif isinstance(keys[0], tuple):
+                # Pick a random range segment, then sample uniformly within it.
+                lo, hi = keys[int(rng.integers(len(keys)))]
+                val = float(rng.uniform(lo, hi))
+            else:
+                # Discrete or densely sampled float keys.
+                # Treat as discrete if few unique values, else uniform in [min, max].
+                keys_f = sorted(float(k) for k in keys)
+                if len(keys_f) <= search_steps // 2:
+                    # Discrete — pick one of the valid settings.
+                    val = keys_f[int(rng.integers(len(keys_f)))]
+                else:
+                    # Continuous — sample uniformly between the discovered bounds.
+                    val = float(rng.uniform(keys_f[0], keys_f[-1]))
+
+            self.synth.set_parameter(idx, val)
+            set_map[idx] = val
+        return set_map
+
+    def reset_parameters(self):
+        """Reset all parameters to their default values (0.5 midpoint heuristic).
+
+        Note: dawdreamer doesn't expose get_default_parameter_value; resetting to
+        0.5 is a safe heuristic for most VSTs.  Pass explicit values if you need
+        deterministic defaults.
+        """
+        n_total = self._get_n_params()
+        for i in range(n_total):
+            self.synth.set_parameter(i, 0.5)
 
     def render_notes(
         self,

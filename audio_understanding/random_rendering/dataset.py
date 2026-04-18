@@ -24,9 +24,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from torch.utils.data import Dataset
 
 from audio_understanding.random_rendering.rendering import Sampler as RenderEngine
 from audio_understanding.random_rendering.sampler import MarginalRandomSampler
+from audio_understanding.random_rendering.dsp_render import pianoish_fast, midi_to_hz
 
 TRANSCRIPTION_QUESTIONS = [
     "Music transcription.",
@@ -130,6 +132,205 @@ def make_token_fn(clip_duration: float, **midi2tokens_kwargs) -> Callable[[List[
         return m2t(data)["token"]
 
     return token_fn
+
+
+def collate_random_token_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collate function for token rendering datasets.
+
+    Keeps question/token as Python lists because each token sequence has variable length.
+    """
+    audio_np = np.stack([item["audio"] for item in items], axis=0)  # (B, 1, T)
+    return {
+        "dataset_name": [item["dataset_name"] for item in items],
+        "audio": torch.from_numpy(audio_np),
+        "question": [item["question"] for item in items],
+        "token": [item["token"] for item in items],
+    }
+
+
+def collate_framewise_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collate function for framewise rendering datasets."""
+    return {
+        "audio": torch.from_numpy(np.stack([it["audio"] for it in items])),
+        "frame_roll": torch.from_numpy(np.stack([it["frame_roll"] for it in items])),
+        "onset_roll": torch.from_numpy(np.stack([it["onset_roll"] for it in items])),
+        "offset_roll": torch.from_numpy(np.stack([it["offset_roll"] for it in items])),
+    }
+
+
+class BaseRenderingDataset(Dataset):
+    """Unified base class for on-the-fly rendering datasets.
+
+    Subclasses should implement __getitem__ and put all rendering logic there.
+    This makes different render backends (sample-based, VST, external program)
+    share the same dataset access interface.
+    """
+
+    def __init__(self, clip_duration: float, epoch_size: int):
+        self.clip_duration = float(clip_duration)
+        self.epoch_size = int(epoch_size)
+
+    def __len__(self) -> int:
+        return self.epoch_size
+
+
+class RandomTokenRenderingDataset(BaseRenderingDataset):
+    """On-the-fly random rendering dataset for autoregressive token training."""
+
+    def __init__(
+        self,
+        render_engine,
+        note_sampler,
+        clip_duration: float,
+        token_fn: Callable[[List[Dict]], List[str]],
+        epoch_size: int,
+    ):
+        super().__init__(clip_duration=clip_duration, epoch_size=epoch_size)
+        self.render_engine = render_engine
+        self.note_sampler = note_sampler
+        self.token_fn = token_fn
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        del idx
+        note_dicts = self.note_sampler.sample(seed=None)
+        audio = self.render_engine.render_notes(note_dicts, time=self.clip_duration)
+        tokens = self.token_fn(note_dicts)
+        return {
+            "dataset_name": "RandomRendering",
+            "audio": audio[np.newaxis, :],
+            "question": random.choice(TRANSCRIPTION_QUESTIONS),
+            "token": tokens,
+        }
+
+
+class RandomFramewiseRenderingDataset(BaseRenderingDataset):
+    """On-the-fly random rendering dataset for frame/onset/offset prediction."""
+
+    def __init__(
+        self,
+        render_engine,
+        note_sampler,
+        clip_duration: float,
+        fps: float,
+        epoch_size: int,
+        pitches_num: int = 128,
+    ):
+        super().__init__(clip_duration=clip_duration, epoch_size=epoch_size)
+        self.render_engine = render_engine
+        self.note_sampler = note_sampler
+        self.fps = float(fps)
+        self.pitches_num = int(pitches_num)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        del idx
+        note_dicts = self.note_sampler.sample(seed=None)
+        audio = self.render_engine.render_notes(note_dicts, time=self.clip_duration)
+        frame_roll, onset_roll, offset_roll = notes_to_piano_roll(
+            note_dicts,
+            fps=self.fps,
+            clip_duration=self.clip_duration,
+            pitches_num=self.pitches_num,
+        )
+        return {
+            "audio": audio[np.newaxis, :],
+            "frame_roll": frame_roll,
+            "onset_roll": onset_roll,
+            "offset_roll": offset_roll,
+        }
+
+
+class DSPFramewiseRenderingDataset(BaseRenderingDataset):
+    """On-the-fly framewise dataset using procedural DSP piano-like rendering."""
+
+    def __init__(
+        self,
+        note_sampler,
+        clip_duration: float,
+        fps: float,
+        sr: int,
+        epoch_size: int,
+        pitches_num: int = 128,
+    ):
+        super().__init__(clip_duration=clip_duration, epoch_size=epoch_size)
+        self.note_sampler = note_sampler
+        self.fps = float(fps)
+        self.sr = int(sr)
+        self.pitches_num = int(pitches_num)
+        self.lowpass_max = 8000.0  # max lowpass cutoff for pianoish_fast
+
+    def _render_notes_dsp(self, note_dicts: List[Dict[str, Any]]) -> np.ndarray:
+        total_samples = int(round(self.clip_duration * self.sr))
+        out = np.zeros(total_samples, dtype=np.float32)
+        rng = np.random.default_rng()
+
+        for n in note_dicts:
+            start = float(n["start"])
+            dur = float(n["dur"])
+            pitch = float(n["pitch"])
+            velocity = float(n["velocity"]) / 127.0
+
+            if dur <= 0.0:
+                continue
+            if start >= self.clip_duration or start + dur <= 0.0:
+                continue
+
+            # Keep synthesis stable for very short sampled notes.
+            dur = max(dur, 0.01)
+
+            f0 = midi_to_hz(pitch)
+            lowpass_min = max(1.25 * f0, 1200.0)
+            lowpass_max = self.lowpass_max
+
+            note_seed = int(rng.integers(0, 2**31 - 1))
+            note_audio = pianoish_fast(
+                duration=dur,
+                pitch=pitch,
+                velocity=velocity,
+                sr=self.sr,
+                seed=note_seed,
+                use_lowpass=True,
+                lowpass_range=(lowpass_min, lowpass_max),
+                core_mode="harmonic",
+            )
+
+            write_start = int(round(start * self.sr))
+            src_start = 0
+            if write_start < 0:
+                src_start = -write_start
+                write_start = 0
+
+            if write_start >= total_samples or src_start >= len(note_audio):
+                continue
+
+            write_end = min(total_samples, write_start + (len(note_audio) - src_start))
+            if write_end <= write_start:
+                continue
+
+            seg_len = write_end - write_start
+            out[write_start:write_end] += note_audio[src_start:src_start + seg_len]
+
+        peak = float(np.max(np.abs(out))) + 1e-9
+        if peak > 1.0:
+            out = 0.95 * out / peak
+
+        return out.astype(np.float32, copy=False)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        del idx
+        note_dicts = self.note_sampler.sample(seed=None)
+        audio = self._render_notes_dsp(note_dicts)
+        frame_roll, onset_roll, offset_roll = notes_to_piano_roll(
+            note_dicts,
+            fps=self.fps,
+            clip_duration=self.clip_duration,
+            pitches_num=self.pitches_num,
+        )
+        return {
+            "audio": audio[np.newaxis, :],
+            "frame_roll": frame_roll,
+            "onset_roll": onset_roll,
+            "offset_roll": offset_roll,
+        }
 
 
 # ---- multiprocessing worker (module-level for spawn) ----
@@ -356,7 +557,7 @@ def _clip_midi_to_note_dicts(
 ) -> List[Dict]:
     """Read MIDI with symusic, clip to [start_time, start_time+clip_duration], return note dicts."""
     from symusic import Score
-    score = Score(midi_path, ttype="second")
+    score: Any = Score(midi_path, ttype="second")
     from audio_understanding.utils_midi_symusic import clip_symusic_notes
 
     note_dicts = []

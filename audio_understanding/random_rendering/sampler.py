@@ -4,7 +4,7 @@ import numpy as np
 import random 
 import json
 from collections import defaultdict
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 def _apply_fifo(notes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Per (program, pitch) channel: eliminate containment while allowing overlap.
@@ -70,7 +70,7 @@ class BaseSampler:
     def __init__(self, time: float):
         self.time = time
         
-    def sample(self, seed: int = None):
+    def sample(self, seed: Optional[int] = None):
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
@@ -136,7 +136,7 @@ class MarginalRandomSampler(BaseSampler):
             self.dur_lo = max(0.01, float(min(vals)))
             self.dur_hi = float(max(vals))
         
-    def sample(self, seed) -> List[Dict[str, Any]]:
+    def sample(self, seed: Optional[int] = None) -> List[Dict[str, Any]]:
         if seed is not None:
             super().sample(seed)
         notes = []

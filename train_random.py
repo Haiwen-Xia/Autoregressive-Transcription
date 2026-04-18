@@ -1,14 +1,12 @@
 """Online-rendering training script.
 
-Flow per round:
-    1. render_epoch → fill buffer
-    2. shuffle + iterate epoch repeat_times times
-    3. repeat
+Flow:
+    1. on-the-fly rendering dataset (__getitem__)
+    2. InfiniteSampler + DataLoader for unified backend access
+    3. train/validate with the same batch interface
 """
 from __future__ import annotations
 
-import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,15 +14,21 @@ import hydra
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 import wandb
 from audidata.collate.default import collate_fn
-from audio_understanding.random_rendering.dataset import OnlineRenderingBuffer, make_token_fn
+from audidata.samplers import InfiniteSampler
+from audio_understanding.random_rendering.dataset import (
+    RandomTokenRenderingDataset,
+    collate_random_token_batch,
+    make_token_fn,
+)
 from audio_understanding.random_rendering.rendering import DawDreamerSampler, Sampler as RenderEngine
 from audio_understanding.random_rendering.sampler import MarginalRandomSampler, UniformSampler
-from audio_understanding.utils import LinearWarmUp, remove_padded_columns
+from audio_understanding.utils import remove_padded_columns
 from train import (
     _count_model_params,
     _setup_output_and_logger,
@@ -166,19 +170,15 @@ def validate_maestro(
 
 def validate_random(
     configs: dict,
-    buffer: OnlineRenderingBuffer,
+    dataloader,
     audio_encoder,
     tokenizer,
     llm,
     token_type_ranges: dict,
     valid_size: int = 64,
 ) -> dict:
-    """Validate on freshly rendered random data, returning per-token-type CE losses.
-
-    Renders *valid_size* new samples, iterates once, returns same metric keys as validate_maestro.
-    """
+    """Validate on freshly rendered random data from a dataset dataloader."""
     device = next(audio_encoder.parameters()).device
-    batch_size = configs["train"]["batch_size_per_device"]
     pad_id = tokenizer.pad_token_id
 
     onset_id = token_type_ranges["name_onset"][0]
@@ -187,12 +187,9 @@ def validate_random(
     pitch_lo, pitch_hi = token_type_ranges["pitch"]
     vel_lo, vel_hi = token_type_ranges["velocity"]
 
-    # val_buffer is independent from training buffer — render directly without save/restore
-    buffer.render_epoch(valid_size, seed=999999)
-
     accum = {k: [] for k in ["total", "pitch", "onset", "offset", "velocity"]}
-
-    for data in buffer.iterate_epoch(batch_size, repeat=1):
+    n_seen = 0
+    for data in dataloader:
         audio, question, answering = get_audio_question_answering(data)
         audio = audio.to(device)
 
@@ -233,6 +230,10 @@ def validate_random(
         accum["onset"].append(_masked_ce(flat_logits, flat_targets, is_time & (next_targets == onset_id), pad_id).item())
         accum["offset"].append(_masked_ce(flat_logits, flat_targets, is_time & (next_targets == offset_id), pad_id).item())
         accum["velocity"].append(_masked_ce(flat_logits, flat_targets, is_vel, pad_id).item())
+
+        n_seen += audio.shape[0]
+        if n_seen >= valid_size:
+            break
 
     return {f"{k}_ce": float(np.mean(v)) if v else 0.0 for k, v in accum.items()}
 
@@ -284,7 +285,7 @@ def main_func(cfg: DictConfig) -> None:
         llm_total // 1024**2, llm_trainable // 1024**2,
     )
 
-    # ---- online rendering buffer ----
+    # ---- on-the-fly rendering dataset ----
     rendering_cfg = configs["rendering"]
     rendering_engine_type = rendering_cfg.get("rendering_engine", "sampler")
     if rendering_engine_type == "dawdreamer":
@@ -327,49 +328,48 @@ def main_func(cfg: DictConfig) -> None:
         include_program=include_program_flag,
         event_token_order=configs.get("midi_event_token_order", "time_first"),
     )
-    token_fn_kwargs = dict(
-        clip_duration=configs["clip_duration"],
-        fps=configs["fps"],
-        include_program=include_program_flag,
-        event_token_order=configs.get("midi_event_token_order", "time_first"),
-    )
-    if rendering_engine_type == "dawdreamer":
-        engine_spec = dict(
-            type="dawdreamer",
-            time=configs["clip_duration"],
-            sr=configs["sample_rate"],
-            vst_path=rendering_cfg["vst_name"],
-            buffer_size=rendering_cfg.get("buffer_size", 512),
-        )
-    else:
-        engine_spec = dict(
-            type="sampler",
-            time=configs["clip_duration"],
-            sr=configs["sample_rate"],
-            data_dir=rendering_cfg["data_dir"],
-        )
-    buffer = OnlineRenderingBuffer(
-        render_engine=render_engine,
-        note_sampler=note_sampler,
-        clip_duration=configs["clip_duration"],
-        token_fn=token_fn,
-        engine_spec=engine_spec,
-        token_fn_kwargs=token_fn_kwargs,
-    )
-
-    # ---- independent val buffer (same engine/sampler, never used for training) ----
-    val_buffer = OnlineRenderingBuffer(
-        render_engine=render_engine,
-        note_sampler=note_sampler,
-        clip_duration=configs["clip_duration"],
-        token_fn=token_fn,
-        engine_spec=engine_spec,
-        token_fn_kwargs=token_fn_kwargs,
-    )
-
-    epoch_size = rendering_cfg["epoch_size"]
-    repeat_times = rendering_cfg["repeat_times"]
+    epoch_size = int(rendering_cfg["epoch_size"])
+    repeat_times = int(rendering_cfg["repeat_times"])
     batch_size = configs["train"]["batch_size_per_device"]
+    train_dataset = RandomTokenRenderingDataset(
+        render_engine=render_engine,
+        note_sampler=note_sampler,
+        clip_duration=configs["clip_duration"],
+        token_fn=token_fn,
+        epoch_size=max(1, epoch_size * repeat_times),
+    )
+    val_dataset = RandomTokenRenderingDataset(
+        render_engine=render_engine,
+        note_sampler=note_sampler,
+        clip_duration=configs["clip_duration"],
+        token_fn=token_fn,
+        epoch_size=max(1, int(rendering_cfg.get("val_epoch_size", 64))),
+    )
+
+    render_num_workers = int(rendering_cfg.get("num_workers", 0))
+    train_loader_kwargs = {
+        "dataset": train_dataset,
+        "batch_size": batch_size,
+        "sampler": InfiniteSampler(train_dataset),
+        "num_workers": render_num_workers,
+        "collate_fn": collate_random_token_batch,
+        "pin_memory": True,
+    }
+    if render_num_workers > 0:
+        train_loader_kwargs["multiprocessing_context"] = "spawn"
+        train_loader_kwargs["prefetch_factor"] = int(rendering_cfg.get("prefetch_factor", 4))
+        train_loader_kwargs["persistent_workers"] = True
+    train_dataloader = DataLoader(**train_loader_kwargs)
+
+    val_loader_kwargs = {
+        "dataset": val_dataset,
+        "batch_size": batch_size,
+        "sampler": InfiniteSampler(val_dataset),
+        "num_workers": 0,
+        "collate_fn": collate_random_token_batch,
+        "pin_memory": True,
+    }
+    val_random_dataloader = DataLoader(**val_loader_kwargs)
 
     gradient_accumulation = configs["train"].get("gradient_accumulation", 1)
     grad_clip_norm = configs["train"].get("grad_clip_norm", None)
@@ -379,10 +379,7 @@ def main_func(cfg: DictConfig) -> None:
     training_steps = configs["train"]["training_steps"]
     test_every_n_steps = configs["train"]["test_every_n_steps"]
     global_step = 0
-    epoch_counter = 0
     optimizer.zero_grad()
-
-    render_num_workers = rendering_cfg.get("num_workers", 0)
 
     # ---- MAESTRO test set for validation ----
     test_dataset = None
@@ -391,122 +388,115 @@ def main_func(cfg: DictConfig) -> None:
         test_dataset = get_dataset(configs, split="test", use_crop=True)
         logger.info("Loaded MAESTRO test set: %d samples", len(test_dataset))
 
-    logger.info("epoch_size=%d  repeat_times=%d  batch_size=%d", epoch_size, repeat_times, batch_size)
+    logger.info("dataset_epoch_size=%d  repeat_times=%d  batch_size=%d", epoch_size, repeat_times, batch_size)
 
     # ---- training loop ----
     pbar = tqdm(total=training_steps, desc="train", disable=configs.get("no_tqdm", False))
+    train_iter = iter(train_dataloader)
     while global_step < training_steps:
-        # 1) render epoch
-        before_render_time = datetime.now()
-        buffer.render_epoch(epoch_size, seed=epoch_counter * epoch_size, num_workers=render_num_workers)
-        after_render_time = datetime.now()
-        epoch_counter += 1
-        render_duration = (after_render_time - before_render_time).total_seconds() / 60.0
-        logger.info("Rendered epoch %d in %.2f minutes, buffer size=%d",
-            epoch_counter, render_duration, len(buffer))
-        # 2) shuffle + iterate epoch repeat_times times
-        for data in buffer.iterate_epoch(batch_size, repeat=repeat_times):
-            audio, question, answering = get_audio_question_answering(data)
-            audio = audio.to(device)
+        data = next(train_iter)
+        audio, question, answering = get_audio_question_answering(data)
+        audio = audio.to(device)
 
-            audio_latent = audio_encoder.encode(
-                audio=audio, train_mode=configs["audio_encoder"]["trainable"],
+        audio_latent = audio_encoder.encode(
+            audio=audio, train_mode=configs["audio_encoder"]["trainable"],
+        )
+
+        question_ids = tokenizer.texts_to_ids(
+            texts=question, fix_length=configs["max_question_len"],
+        ).to(device)
+
+        answering_ids = tokenizer.texts_to_ids(
+            texts=answering, fix_length=configs["max_answering_len"],
+        ).to(device)
+
+        if configs["train"]["remove_padded_columns"]:
+            answering_ids = remove_padded_columns(
+                ids=answering_ids, pad_token_id=tokenizer.pad_token_id,
             )
 
-            question_ids = tokenizer.texts_to_ids(
-                texts=question, fix_length=configs["max_question_len"],
-            ).to(device)
+        seqs = [audio_latent, question_ids, answering_ids]
+        seq_types = ["audio", "id", "id"]
+        loss_types = [None, None, "ce"]
 
-            answering_ids = tokenizer.texts_to_ids(
-                texts=answering, fix_length=configs["max_answering_len"],
-            ).to(device)
+        llm.train()
+        output_seqs = llm(seqs=seqs, seq_types=seq_types, mask=None)
 
-            if configs["train"]["remove_padded_columns"]:
-                answering_ids = remove_padded_columns(
-                    ids=answering_ids, pad_token_id=tokenizer.pad_token_id,
-                )
+        output_seqs = [seq[:, :-1] for seq in output_seqs]
+        target_seqs = [seq[:, 1:] for seq in seqs]
 
-            seqs = [audio_latent, question_ids, answering_ids]
-            seq_types = ["audio", "id", "id"]
-            loss_types = [None, None, "ce"]
+        loss = ce_loss(
+            output_seqs=output_seqs,
+            target_seqs=target_seqs,
+            loss_types=loss_types,
+            ignore_index=tokenizer.pad_token_id,
+        )
 
-            llm.train()
-            output_seqs = llm(seqs=seqs, seq_types=seq_types, mask=None)
+        (loss / gradient_accumulation).backward()
 
-            output_seqs = [seq[:, :-1] for seq in output_seqs]
-            target_seqs = [seq[:, 1:] for seq in seqs]
-
-            loss = ce_loss(
-                output_seqs=output_seqs,
-                target_seqs=target_seqs,
-                loss_types=loss_types,
-                ignore_index=tokenizer.pad_token_id,
-            )
-
-            (loss / gradient_accumulation).backward()
-
-            if (global_step + 1) % gradient_accumulation != 0:
-                global_step += 1
-                pbar.update(1)
-                continue
-
-            if grad_clip_norm is not None:
-                params_to_clip = [p for p in list(audio_encoder.parameters()) + list(llm.parameters()) if p.requires_grad]
-                torch.nn.utils.clip_grad_norm_(params_to_clip, grad_clip_norm)
-
-            optimizer.step()
-            optimizer.zero_grad()
-            if scheduler:
-                scheduler.step()
-
+        if (global_step + 1) % gradient_accumulation != 0:
             global_step += 1
             pbar.update(1)
+            continue
 
-            if global_step % 100 == 0:
-                logger.info("step=%d loss=%.6f", global_step, loss.item())
-                if wandb_log:
-                    wandb.log({"train_loss": loss.item()}, step=global_step)
+        if grad_clip_norm is not None:
+            params_to_clip = [p for p in list(audio_encoder.parameters()) + list(llm.parameters()) if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(params_to_clip, grad_clip_norm)
 
-            # ---- validate on MAESTRO test set ----
-            if test_dataset is not None and global_step > 0 and global_step % test_every_n_steps == 0:
-                val_metrics = validate_maestro(
-                    configs=configs,
-                    dataset=test_dataset,
-                    audio_encoder=audio_encoder,
-                    tokenizer=tokenizer,
-                    llm=llm,
-                    token_type_ranges=token_type_ranges,
-                )
-                logger.info("step=%d val_maestro: %s", global_step, val_metrics)
-                if wandb_log:
-                    wandb.log({f"val_maestro/{k}": v for k, v in val_metrics.items()}, step=global_step)
+        optimizer.step()
+        optimizer.zero_grad()
+        if scheduler:
+            scheduler.step()
 
-            # ---- validate on random rendering ----
-            if global_step > 0 and global_step % test_every_n_steps == 0:
-                val_rand = validate_random(
-                    configs=configs,
-                    buffer=val_buffer,
-                    audio_encoder=audio_encoder,
-                    tokenizer=tokenizer,
-                    llm=llm,
-                    token_type_ranges=token_type_ranges,
-                )
-                logger.info("step=%d val_random: %s", global_step, val_rand)
-                if wandb_log:
-                    wandb.log({f"val_random/{k}": v for k, v in val_rand.items()}, step=global_step)
+        global_step += 1
+        pbar.update(1)
 
-            if global_step > 0 and global_step % configs["train"]["save_every_n_steps"] == 0:
-                ckpt_path = ckpt_dir / f"step={global_step}.pth"
-                ckpt = {}
-                if configs["audio_encoder"]["trainable"]:
-                    ckpt["audio_encoder"] = audio_encoder.state_dict()
-                if configs["llm"]["trainable"]:
-                    ckpt["llm"] = llm.state_dict()
-                torch.save(ckpt, ckpt_path)
-                logger.info("Saved %s", ckpt_path)
+        if global_step % 100 == 0:
+            logger.info("step=%d loss=%.6f", global_step, loss.item())
+            if wandb_log:
+                wandb.log({"train_loss": loss.item()}, step=global_step)
 
-            if global_step >= training_steps:
-                break
+        # ---- validate on MAESTRO test set ----
+        if test_dataset is not None and global_step > 0 and global_step % test_every_n_steps == 0:
+            val_metrics = validate_maestro(
+                configs=configs,
+                dataset=test_dataset,
+                audio_encoder=audio_encoder,
+                tokenizer=tokenizer,
+                llm=llm,
+                token_type_ranges=token_type_ranges,
+            )
+            logger.info("step=%d val_maestro: %s", global_step, val_metrics)
+            if wandb_log:
+                wandb.log({f"val_maestro/{k}": v for k, v in val_metrics.items()}, step=global_step)
+
+        # ---- validate on random rendering ----
+        if global_step > 0 and global_step % test_every_n_steps == 0:
+            val_rand = validate_random(
+                configs=configs,
+                dataloader=val_random_dataloader,
+                audio_encoder=audio_encoder,
+                tokenizer=tokenizer,
+                llm=llm,
+                token_type_ranges=token_type_ranges,
+                valid_size=int(rendering_cfg.get("val_epoch_size", 64)),
+            )
+            logger.info("step=%d val_random: %s", global_step, val_rand)
+            if wandb_log:
+                wandb.log({f"val_random/{k}": v for k, v in val_rand.items()}, step=global_step)
+
+        if global_step > 0 and global_step % configs["train"]["save_every_n_steps"] == 0:
+            ckpt_path = ckpt_dir / f"step={global_step}.pth"
+            ckpt = {}
+            if configs["audio_encoder"]["trainable"]:
+                ckpt["audio_encoder"] = audio_encoder.state_dict()
+            if configs["llm"]["trainable"]:
+                ckpt["llm"] = llm.state_dict()
+            torch.save(ckpt, ckpt_path)
+            logger.info("Saved %s", ckpt_path)
+
+        if global_step >= training_steps:
+            break
 
     pbar.close()
     logger.info("Done. total steps=%d", global_step)
