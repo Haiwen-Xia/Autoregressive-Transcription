@@ -28,7 +28,8 @@ from torch.utils.data import Dataset
 
 from audio_understanding.random_rendering.rendering import Sampler as RenderEngine
 from audio_understanding.random_rendering.sampler import MarginalRandomSampler
-from audio_understanding.random_rendering.dsp_render import pianoish_fast, midi_to_hz
+from audio_understanding.random_rendering.dsp_render import pianoish_fast, pianoish_physics, pianoish_fixed, midi_to_hz
+from audio_understanding.random_rendering.dsp_gp import generate_music_note, random_sample_params, precompute_gp_cholesky
 
 TRANSCRIPTION_QUESTIONS = [
     "Music transcription.",
@@ -150,12 +151,15 @@ def collate_random_token_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def collate_framewise_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Collate function for framewise rendering datasets."""
-    return {
+    batch = {
         "audio": torch.from_numpy(np.stack([it["audio"] for it in items])),
         "frame_roll": torch.from_numpy(np.stack([it["frame_roll"] for it in items])),
         "onset_roll": torch.from_numpy(np.stack([it["onset_roll"] for it in items])),
         "offset_roll": torch.from_numpy(np.stack([it["offset_roll"] for it in items])),
     }
+    if "note_dicts" in items[0]:
+        batch["note_dicts"] = [it["note_dicts"] for it in items]
+    return batch
 
 
 class BaseRenderingDataset(Dataset):
@@ -236,6 +240,7 @@ class RandomFramewiseRenderingDataset(BaseRenderingDataset):
             "frame_roll": frame_roll,
             "onset_roll": onset_roll,
             "offset_roll": offset_roll,
+            "note_dicts": note_dicts,
         }
 
 
@@ -250,6 +255,7 @@ class DSPFramewiseRenderingDataset(BaseRenderingDataset):
         sr: int,
         epoch_size: int,
         pitches_num: int = 128,
+        dsp_variant: str = "fast",  # "fast" | "physics" | "fixed"
     ):
         super().__init__(clip_duration=clip_duration, epoch_size=epoch_size)
         self.note_sampler = note_sampler
@@ -257,6 +263,8 @@ class DSPFramewiseRenderingDataset(BaseRenderingDataset):
         self.sr = int(sr)
         self.pitches_num = int(pitches_num)
         self.lowpass_max = 8000.0  # max lowpass cutoff for pianoish_fast
+        assert dsp_variant in ("fast", "physics", "fixed"), f"Unknown dsp_variant: {dsp_variant}"
+        self.dsp_variant = dsp_variant
 
     def _render_notes_dsp(self, note_dicts: List[Dict[str, Any]]) -> np.ndarray:
         total_samples = int(round(self.clip_duration * self.sr))
@@ -282,16 +290,35 @@ class DSPFramewiseRenderingDataset(BaseRenderingDataset):
             lowpass_max = self.lowpass_max
 
             note_seed = int(rng.integers(0, 2**31 - 1))
-            note_audio = pianoish_fast(
-                duration=dur,
-                pitch=pitch,
-                velocity=velocity,
-                sr=self.sr,
-                seed=note_seed,
-                use_lowpass=True,
-                lowpass_range=(lowpass_min, lowpass_max),
-                core_mode="harmonic",
-            )
+            if self.dsp_variant == "fast":
+                note_audio = pianoish_fast(
+                    duration=dur,
+                    pitch=pitch,
+                    velocity=velocity,
+                    sr=self.sr,
+                    seed=note_seed,
+                    use_lowpass=True,
+                    lowpass_range=(lowpass_min, lowpass_max),
+                    core_mode="harmonic",
+                )
+            elif self.dsp_variant == "physics":
+                note_audio = pianoish_physics(
+                    duration=dur,
+                    pitch=pitch,
+                    velocity=velocity,
+                    sr=self.sr,
+                    seed=note_seed,
+                    use_lowpass=True,
+                    lowpass_range=(lowpass_min, lowpass_max),
+                )
+            else:  # fixed
+                note_audio = pianoish_fixed(
+                    duration=dur,
+                    pitch=pitch,
+                    velocity=velocity,
+                    sr=self.sr,
+                    seed=note_seed,
+                )
 
             write_start = int(round(start * self.sr))
             src_start = 0
@@ -330,7 +357,124 @@ class DSPFramewiseRenderingDataset(BaseRenderingDataset):
             "frame_roll": frame_roll,
             "onset_roll": onset_roll,
             "offset_roll": offset_roll,
+            "note_dicts": note_dicts,
         }
+
+
+class GPRenderDataset(BaseRenderingDataset):
+    """On-the-fly framewise dataset using GP-based additive synthesis (dsp_gp).
+
+    Each note keeps independent timbre sampling for diversity.
+    All notes in a clip share the same mix buffer.
+    """
+
+    def __init__(
+        self,
+        note_sampler,
+        clip_duration: float,
+        fps: float,
+        sr: int,
+        epoch_size: int,
+        pitches_num: int = 128,
+    ):
+        super().__init__(clip_duration=clip_duration, epoch_size=epoch_size)
+        self.note_sampler = note_sampler
+        self.fps = float(fps)
+        self.sr = int(sr)
+        self.pitches_num = int(pitches_num)
+
+    def _render_notes_gp(self, note_dicts: List[Dict[str, Any]]) -> np.ndarray:
+        """Render a list of note dicts using generate_music_note, mix into clip.
+
+        GP 核协方差（Exponential + StdPeriodic）每个 clip 预先计算一次 (O(n^3))，
+        同一 clip 内所有 note 共用 Cholesky 因子，采样时只需矩阵向量乘 (O(n^2))。
+        其他 timbre 参数（n_overtones、rolloff、decay 等）每个 note 仍独立随机。
+        """
+        total_samples = int(round(self.clip_duration * self.sr))
+        out = np.zeros(total_samples, dtype=np.float32)
+        global_rng = np.random.default_rng()
+
+        # 每个 clip 采样一组共享的 GP 核参数，预计算 Cholesky
+        n_frames = 100
+        gp_variance       = float(global_rng.uniform(0.5, 2.5))
+        gp_lengthscale    = float(global_rng.uniform(0.15, 0.6))
+        vibrato_variance  = float(global_rng.uniform(0.5, 2.0))
+        vibrato_period    = float(global_rng.uniform(0.08, 0.3))
+        vibrato_lengthscale = float(global_rng.uniform(0.05, 0.2))
+        L_gp_exp, L_gp_vibrato = precompute_gp_cholesky(
+            n_frames, gp_variance, gp_lengthscale,
+            vibrato_variance, vibrato_period, vibrato_lengthscale,
+        )
+
+        for n in note_dicts:
+            start = float(n["start"])
+            dur = float(n["dur"])
+            pitch = float(n["pitch"])
+            # sampler velocity is 0-127 int; normalize to 0-1
+            velocity = float(n["velocity"]) / 127.0
+
+            if dur <= 0.0 or start >= self.clip_duration or start + dur <= 0.0:
+                continue
+
+            note_seed = int(global_rng.integers(0, 2**31 - 1))
+            # 每个 note 独立采样 timbre 参数，但覆盖 GP 核参数以匹配预计算的 L
+            note_timbre_params = random_sample_params(np.random.default_rng(note_seed))
+            note_timbre_params["n_frames"]           = n_frames
+            note_timbre_params["gp_variance"]        = gp_variance
+            note_timbre_params["gp_lengthscale"]     = gp_lengthscale
+            note_timbre_params["vibrato_variance"]   = vibrato_variance
+            note_timbre_params["vibrato_period"]     = vibrato_period
+            note_timbre_params["vibrato_lengthscale"] = vibrato_lengthscale
+
+            note_audio, _ = generate_music_note(
+                pitch=pitch,
+                duration=max(dur, 0.02),
+                velocity=velocity,
+                sr=self.sr,
+                seed=note_seed,
+                L_gp_exp=L_gp_exp,
+                L_gp_vibrato=L_gp_vibrato,
+                **note_timbre_params,
+            )
+
+            write_start = int(round(start * self.sr))
+            src_start = 0
+            if write_start < 0:
+                src_start = -write_start
+                write_start = 0
+
+            if write_start >= total_samples or src_start >= len(note_audio):
+                continue
+
+            write_end = min(total_samples, write_start + (len(note_audio) - src_start))
+            seg_len = write_end - write_start
+            out[write_start:write_end] += note_audio[src_start:src_start + seg_len].astype(np.float32)
+
+        peak = float(np.max(np.abs(out))) + 1e-9
+        if peak > 1.0:
+            out = 0.95 * out / peak
+        return out
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        del idx
+        note_dicts = self.note_sampler.sample(seed=None)
+        audio = self._render_notes_gp(note_dicts)
+        frame_roll, onset_roll, offset_roll = notes_to_piano_roll(
+            note_dicts,
+            fps=self.fps,
+            clip_duration=self.clip_duration,
+            pitches_num=self.pitches_num,
+        )
+        return {
+            "audio": audio[np.newaxis, :],
+            "frame_roll": frame_roll,
+            "onset_roll": onset_roll,
+            "offset_roll": offset_roll,
+            "note_dicts": note_dicts,
+        }
+
+
+DSPGPFramewiseRenderingDataset = GPRenderDataset  # backward compat alias
 
 
 # ---- multiprocessing worker (module-level for spawn) ----

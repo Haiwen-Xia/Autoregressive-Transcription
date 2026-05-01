@@ -142,7 +142,7 @@ class MidiSampler:
         self.clip_duration = clip_duration
         self.cc_config = cc_config or {}
 
-    def sample(self, seed: int = None) -> tuple[Score, List[Dict[str, Any]]]:
+    def sample(self, seed: Optional[int] = None) -> tuple[Score, List[Dict[str, Any]]]:
         """Sample notes + CC → (symusic Score, note_dicts).
 
         Returns both the Score (for MIDI file export) and the raw note_dicts
@@ -159,7 +159,7 @@ class MidiSampler:
         score = note_dicts_to_score(notes, self.clip_duration, cc_events)
         return score, notes
 
-    def sample_and_save(self, path: str, seed: int = None) -> List[Dict[str, Any]]:
+    def sample_and_save(self, path: str, seed: Optional[int] = None) -> List[Dict[str, Any]]:
         """Sample → save MIDI file, return note_dicts."""
         score, notes = self.sample(seed=seed)
         score.dump_midi(path)

@@ -276,6 +276,198 @@ def pianoish_fast(
     return y.astype(np.float32)
 
 
+def generate_core_physics(
+    t: np.ndarray,
+    f0: float,
+    sr: int,
+    rng: np.random.Generator,
+    velocity: float,
+    B_range: tuple[float, float] = (0.0002, 0.002),     # inharmonicity coeff
+    rolloff_range: tuple[float, float] = (0.8, 1.5),    # amplitude 1/k^alpha
+    tau_base_range: tuple[float, float] = (0.5, 2.5),   # global decay scale (s)
+    decay_exp_range: tuple[float, float] = (1.2, 1.8),  # per-harmonic decay exponent
+    jitter_db: float = 2.0,
+    max_harmonics: int = 40,
+) -> np.ndarray:
+    """
+    Physics-inspired harmonic core (after new_piano.py).
+
+    Key differences vs generate_core:
+    - Inharmonicity via B coefficient: fk = k*f0*sqrt(1 + B*k^2)
+    - Per-harmonic decay: tau_k = tau_base / k^decay_exp  (higher harmonics die faster)
+    - No detuned side-partials (cleaner spectrum)
+    - Randomization across B, rolloff, tau_base, decay_exp
+
+    Returns
+    -------
+    core : np.ndarray  shape (n,)
+    """
+    n = len(t)
+    nyquist = 0.5 * sr
+    vel = float(np.clip(velocity, 0.0, 1.0))
+
+    B = rng.uniform(*B_range)
+    rolloff = rng.uniform(*rolloff_range)
+    tau_base = rng.uniform(*tau_base_range)
+    decay_exp = rng.uniform(*decay_exp_range)
+    jitter_sigma = jitter_db / 20.0 * np.log(10.0)
+
+    core = np.zeros(n, dtype=np.float64)
+
+    k_max = min(max_harmonics, int(nyquist / max(f0, 1.0)))
+    for k in range(1, k_max + 1):
+        # inharmonic partial frequency
+        fk = k * f0 * np.sqrt(1.0 + B * k ** 2)
+        if fk >= 0.48 * sr:
+            break
+
+        # amplitude: power-law rolloff + velocity-dependent spectral tilt + jitter
+        ak = (k ** (-rolloff))
+        ak *= np.exp(-fk / (3500.0 + 2500.0 * vel))
+        ak *= np.exp(jitter_sigma * rng.standard_normal())
+
+        # per-harmonic exponential decay (physics: tau_k ~ 1/k^alpha)
+        tau_k = tau_base / (k ** decay_exp)
+        # clamp so we don't get infinitely slow / instant decay
+        tau_k = float(np.clip(tau_k, 0.01, 30.0))
+
+        phase0 = 2.0 * np.pi * rng.random()
+        partial = np.sin(2.0 * np.pi * fk * t + phase0)
+        partial *= np.exp(-t / tau_k)
+
+        core += ak * partial
+
+    return core
+
+
+def pianoish_physics(
+    duration: float = 1.2,
+    pitch: float = 60,
+    velocity: float = 0.8,
+    sr: int = 48000,
+    seed: int | None = None,
+    release_range: tuple[float, float] = (0.04, 0.14),
+    attack_time_range: tuple[float, float] = (0.004, 0.012),
+    attack_shape_range: tuple[float, float] = (1.6, 2.8),
+    body_decay_base: float = 0.22,
+    lowpass_range: tuple[float, float] = (2500.0, 8500.0),
+    lowpass_order: int = 2,
+    use_lowpass: bool = True,
+) -> np.ndarray:
+    """
+    Piano variant with physics-inspired inharmonic partials and per-harmonic decay.
+
+    Keeps the same envelope + attack-flavor + lowpass randomization as pianoish_fast.
+    Core is replaced by generate_core_physics (inharmonicity B coeff, tau ~ 1/k^alpha).
+    """
+    rng = np.random.default_rng(seed)
+    vel = float(np.clip(velocity, 0.0, 1.0))
+    f0 = midi_to_hz(pitch)
+
+    release_time = rng.uniform(*release_range)
+    total_duration = duration + release_time
+
+    n = int(np.round(total_duration * sr))
+    t = np.arange(n, dtype=np.float64) / sr
+
+    # envelope (same randomization as pianoish_fast)
+    attack_time = rng.uniform(*attack_time_range)
+    attack_shape = rng.uniform(*attack_shape_range)
+    body_decay_time = body_decay_base + 0.20 * rng.random()
+
+    env = make_envelope(
+        t=t,
+        duration=duration,
+        release_time=release_time,
+        attack_time=attack_time,
+        attack_shape=attack_shape,
+        body_decay_time=body_decay_time,
+    )
+
+    # physics core: inharmonicity + per-harmonic decay
+    core = generate_core_physics(t=t, f0=f0, sr=sr, rng=rng, velocity=vel)
+
+    # attack flavor
+    attack_flavor = generate_attack_flavor(t=t, sr=sr, rng=rng)
+
+    y = core * env + attack_flavor
+
+    if use_lowpass:
+        lp_cutoff = rng.uniform(*lowpass_range)
+        y = random_lowpass(y, lp_cutoff, sr, order=lowpass_order)
+
+    y *= np.minimum(1.10 * env, 1.0)
+
+    peak = np.max(np.abs(y)) + 1e-9
+    y = 0.95 * y / peak
+
+    return y.astype(np.float32)
+
+
+def pianoish_fixed(
+    duration: float = 1.2,
+    pitch: float = 60,
+    velocity: float = 0.8,
+    sr: int = 48000,
+    seed: int | None = None,
+    # fixed envelope params
+    attack_time: float = 0.008,
+    attack_shape: float = 2.2,
+    body_decay_time: float = 0.30,
+    release_time: float = 0.08,
+    # fixed harmonic params
+    rolloff: float = 1.5,
+    tau_base: float = 1.2,
+    decay_exp: float = 1.5,
+    max_harmonics: int = 40,
+) -> np.ndarray:
+    """
+    Derandomized piano: no filter, fixed envelope/decay/harmonic params.
+
+    Useful as ablation baseline — only pitch and velocity vary between notes.
+    seed is accepted but only used for phase initialization (to avoid exact 0).
+    """
+    rng = np.random.default_rng(seed)
+    vel = float(np.clip(velocity, 0.0, 1.0))
+    f0 = midi_to_hz(pitch)
+
+    total_duration = duration + release_time
+    n = int(np.round(total_duration * sr))
+    t = np.arange(n, dtype=np.float64) / sr
+
+    env = make_envelope(
+        t=t,
+        duration=duration,
+        release_time=release_time,
+        attack_time=attack_time,
+        attack_shape=attack_shape,
+        body_decay_time=body_decay_time,
+    )
+
+    nyquist = 0.5 * sr
+    k_max = min(max_harmonics, int(nyquist / max(f0, 1.0)))
+    core = np.zeros(n, dtype=np.float64)
+    for k in range(1, k_max + 1):
+        fk = k * f0
+        if fk >= 0.48 * sr:
+            break
+        ak = (k ** (-rolloff)) * np.exp(-fk / (3500.0 + 2500.0 * vel))
+        tau_k = float(np.clip(tau_base / (k ** decay_exp), 0.01, 30.0))
+        phase0 = 2.0 * np.pi * rng.random()
+        partial = np.sin(2.0 * np.pi * fk * t + phase0)
+        partial *= np.exp(-t / tau_k)
+        core += ak * partial
+
+    y = core * env
+    # no lowpass, no attack flavor
+
+    y *= np.minimum(1.10 * env, 1.0)
+    peak = np.max(np.abs(y)) + 1e-9
+    y = 0.95 * y / peak
+
+    return y.astype(np.float32)
+
+
 if __name__ == "__main__":
     # example
     y = pianoish_fast(

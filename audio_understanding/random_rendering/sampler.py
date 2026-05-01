@@ -3,7 +3,10 @@
 import numpy as np 
 import random 
 import json
+import csv
+import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 def _apply_fifo(notes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -321,6 +324,266 @@ class ChordSampler(BaseSampler):
             for p in pitches
         ]
         return notes
+
+
+def _clip_midi_to_note_dicts(
+    midi_path: str,
+    start_time: float,
+    clip_duration: float,
+) -> List[Dict[str, Any]]:
+    from symusic import Score
+    from audio_understanding.utils_midi_symusic import clip_symusic_notes
+
+    score: Any = Score(midi_path, ttype="second")
+    note_dicts: List[Dict[str, Any]] = []
+
+    for track in score.tracks:
+        is_drum = bool(getattr(track, "is_drum", False))
+        program = 128 if is_drum else int(track.program)
+
+        clipped_notes, _ = clip_symusic_notes(
+            notes=list(track.notes),
+            start_time=start_time,
+            duration=clip_duration,
+            mode="clip",
+        )
+        for note in clipped_notes:
+            note_dicts.append({
+                "start": float(note.time) - start_time,
+                "dur": float(note.duration),
+                "pitch": int(note.pitch),
+                "velocity": int(note.velocity),
+                "program": program,
+            })
+
+    return note_dicts
+
+
+def _load_slakh_pieces(slakh_root: str, split: str) -> List[Dict[str, Any]]:
+    from symusic import Score
+
+    split_dir = Path(slakh_root) / split
+    assert split_dir.exists(), f"Slakh split dir not found: {split_dir}"
+
+    pieces: List[Dict[str, Any]] = []
+    for track_dir in sorted(split_dir.iterdir()):
+        if not track_dir.is_dir():
+            continue
+        midi_path = track_dir / "all_src.mid"
+        if not midi_path.exists():
+            continue
+
+        score: Any = Score(str(midi_path), ttype="second")
+        pieces.append({
+            "midi_path": str(midi_path),
+            "duration": float(score.end()),
+            "track_id": track_dir.name,
+        })
+
+    return pieces
+
+
+def _load_gigamidi_midi_paths(gigamidi_root: str, split: Optional[str] = None) -> List[str]:
+    root = Path(gigamidi_root)
+    scan_root = root if split in (None, "") else root / split
+    assert scan_root.exists(), f"GigaMIDI path not found: {scan_root}"
+
+    midi_paths = sorted(
+        p for p in scan_root.rglob("*")
+        if p.is_file() and p.suffix.lower() in {".mid", ".midi"}
+    )
+    return [str(p) for p in midi_paths]
+
+
+def _resolve_gigamidi_metadata_csv(gigamidi_root: str, metadata_csv_path: Optional[str]) -> Path:
+    if metadata_csv_path is not None:
+        p = Path(metadata_csv_path)
+        assert p.exists(), f"GigaMIDI metadata CSV not found: {p}"
+        return p
+
+    root = Path(gigamidi_root)
+    candidates = [
+        root / "Final-Metadata-Extended-GigaMIDI-Dataset-updated.csv",
+        root.parent / "Final-Metadata-Extended-GigaMIDI-Dataset-updated.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+
+    raise AssertionError(
+        "Cannot find GigaMIDI metadata CSV automatically. "
+        "Please provide metadata_csv_path explicitly."
+    )
+
+
+def _load_expressive_gigamidi_md5_set(metadata_csv: Path) -> set:
+    csv.field_size_limit(sys.maxsize)
+    expressive_cols = [
+        "MIDI program number (expressive)",
+        "instrument_group (expressive)",
+        "start_tick (expressive)",
+        "end_tick (expressive)",
+        "duration_beats (expressive)",
+        "note_density (expressive)",
+        "loopability (expressive)",
+    ]
+
+    expressive_md5_set = set()
+    with open(metadata_csv, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            md5 = row["md5"].strip()
+            if md5 == "":
+                continue
+
+            expressive_hit = False
+            for col in expressive_cols:
+                value = row[col].strip()
+                if value not in ("", "[]", "[-1]"):
+                    expressive_hit = True
+                    break
+
+            if expressive_hit:
+                expressive_md5_set.add(md5)
+
+    return expressive_md5_set
+
+
+def _filter_midi_paths_by_md5(midi_paths: List[str], keep_md5_set: set) -> List[str]:
+    return [p for p in midi_paths if Path(p).stem in keep_md5_set]
+
+
+class SlakhClipSampler(BaseSampler):
+    """Sample Slakh clips with sequential MIDI IDs over shuffled order."""
+
+    def __init__(
+        self,
+        time: float,
+        slakh_root: str,
+        split: str = "train",
+        time_grid: float = 0.01,
+        shuffle_seed: int = 42,
+    ):
+        super().__init__(time=float(time))
+        self.time_grid = float(time_grid)
+        assert self.time_grid > 0.0, f"time_grid must be > 0, got {self.time_grid}"
+
+        pieces = _load_slakh_pieces(slakh_root=slakh_root, split=split)
+        self.pieces = [p for p in pieces if p["duration"] >= self.time]
+        assert len(self.pieces) > 0, "No Slakh pieces long enough for clip_duration"
+
+        self.rng = np.random.RandomState(shuffle_seed)
+        self._order = np.arange(len(self.pieces), dtype=np.int64)
+        self.rng.shuffle(self._order)
+        self._cursor = 0
+
+    def _next_piece(self) -> Dict[str, Any]:
+        if self._cursor >= len(self._order):
+            self.rng.shuffle(self._order)
+            self._cursor = 0
+        piece = self.pieces[int(self._order[self._cursor])]
+        self._cursor += 1
+        return piece
+
+    def sample(self, seed: Optional[int] = None) -> List[Dict[str, Any]]:
+        if seed is not None:
+            self.rng = np.random.RandomState(seed)
+            self._order = np.arange(len(self.pieces), dtype=np.int64)
+            self.rng.shuffle(self._order)
+            self._cursor = 0
+
+        piece = self._next_piece()
+
+        max_start = max(0.0, float(piece["duration"]) - self.time)
+        if max_start <= 0.0:
+            start_time = 0.0
+        else:
+            start_time = float(self.rng.uniform(0.0, max_start))
+        start_time = round(start_time / self.time_grid) * self.time_grid
+
+        return _clip_midi_to_note_dicts(
+            midi_path=piece["midi_path"],
+            start_time=start_time,
+            clip_duration=self.time,
+        )
+
+
+class GigaMIDIClipSampler(BaseSampler):
+    """Sample GigaMIDI clips with sequential MIDI IDs over shuffled order.
+
+    If expressive_only=True, only keep MIDI files whose md5 appears in metadata
+    rows that have at least one non-empty expressive field.
+    """
+
+    def __init__(
+        self,
+        time: float,
+        gigamidi_root: str,
+        split: Optional[str] = None,
+        time_grid: float = 0.01,
+        shuffle_seed: int = 42,
+        expressive_only: bool = False,
+        metadata_csv_path: Optional[str] = None,
+    ):
+        super().__init__(time=float(time))
+        self.time_grid = float(time_grid)
+        assert self.time_grid > 0.0, f"time_grid must be > 0, got {self.time_grid}"
+
+        midi_paths = _load_gigamidi_midi_paths(gigamidi_root=gigamidi_root, split=split)
+        if expressive_only:
+            metadata_csv = _resolve_gigamidi_metadata_csv(
+                gigamidi_root=gigamidi_root,
+                metadata_csv_path=metadata_csv_path,
+            )
+            expressive_md5_set = _load_expressive_gigamidi_md5_set(metadata_csv)
+            midi_paths = _filter_midi_paths_by_md5(midi_paths, expressive_md5_set)
+
+        self.midi_paths = midi_paths
+        assert len(self.midi_paths) > 0, "No GigaMIDI files found"
+
+        self.rng = np.random.RandomState(shuffle_seed)
+        self._order = np.arange(len(self.midi_paths), dtype=np.int64)
+        self.rng.shuffle(self._order)
+        self._cursor = 0
+
+    def _next_midi_path(self) -> str:
+        if self._cursor >= len(self._order):
+            self.rng.shuffle(self._order)
+            self._cursor = 0
+        midi_path = self.midi_paths[int(self._order[self._cursor])]
+        self._cursor += 1
+        return midi_path
+
+    def sample(self, seed: Optional[int] = None) -> List[Dict[str, Any]]:
+        if seed is not None:
+            self.rng = np.random.RandomState(seed)
+            self._order = np.arange(len(self.midi_paths), dtype=np.int64)
+            self.rng.shuffle(self._order)
+            self._cursor = 0
+
+        from symusic import Score
+
+        for _ in range(len(self.midi_paths)):
+            midi_path = self._next_midi_path()
+            score: Any = Score(midi_path, ttype="second")
+            duration = float(score.end())
+            if duration <= 0.0:
+                continue
+
+            max_start = max(0.0, duration - self.time)
+            if max_start <= 0.0:
+                start_time = 0.0
+            else:
+                start_time = float(self.rng.uniform(0.0, max_start))
+            start_time = round(start_time / self.time_grid) * self.time_grid
+
+            return _clip_midi_to_note_dicts(
+                midi_path=midi_path,
+                start_time=start_time,
+                clip_duration=self.time,
+            )
+
+        return []
 
 
 if __name__ == "__main__":
